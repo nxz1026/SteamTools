@@ -1,5 +1,3 @@
-using dotnetCampus.Ipc.CompilerServices.Attributes;
-
 #if APP_REVERSE_PROXY
 
 using InstanceReverseProxyService = BD.WTTS.Services.Implementation.YarpReverseProxyServiceImpl;
@@ -14,11 +12,10 @@ namespace BD.WTTS.Services;
 /// <summary>
 /// 反向代理服务
 /// </summary>
-[IpcPublic(Timeout = AssemblyInfo.IpcTimeout, IgnoresIpcException = false)]
 public partial interface IReverseProxyService : IDisposable
 {
     /// <summary>
-    /// 反向代理的常量与配置项，在插件中由 IPC 远程调用给子进程
+    /// 反向代理的常量与配置项
     /// </summary>
     static class Constants
     {

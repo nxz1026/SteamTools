@@ -16,7 +16,8 @@
 		<ApplicationIcon Condition="'$(Configuration)'=='Debug'">..\..\res\icons\app\v3\Icon.ico</ApplicationIcon>
 	</PropertyGroup>
 
-	<PropertyGroup Condition="$([MSBuild]::IsOSPlatform('windows')) AND ($(RuntimeIdentifier.StartsWith('win-')) OR $(RuntimeIdentifier) == '')">
+	<!-- Windows 目标：本机在 Windows 上，或以 win-* RID 交叉编译（便于在 Linux/macOS 上产出 Windows 版本） -->
+	<PropertyGroup Condition="$([MSBuild]::IsOSPlatform('windows')) OR $(RuntimeIdentifier.StartsWith('win-'))">
 		<DefineConstants>WINDOWS7_0_OR_GREATER;WINDOWS;$(DefineConstants)</DefineConstants>
 	</PropertyGroup>
 
@@ -60,24 +61,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<!-- AppCenter -->
-		<Compile Include="..\VisualStudioAppCenterSDK.cs">
-			<LinkBase>Helpers</LinkBase>
-		</Compile>
-		<Compile Include="..\VisualStudioAppCenterSDK.AppSecret.cs">
-			<LinkBase>Helpers</LinkBase>
-		</Compile>
-	</ItemGroup>
-
-	<ItemGroup>
-		<Compile Include="..\BD.WTTS.Client\Constants\CertificateConstants.cs">
-			<LinkBase>Constants</LinkBase>
-		</Compile>
-		<Compile Include="..\BD.WTTS.Client\Services\Platform\IPlatformService.OS.Linux.Etc.Os_Release.cs">
-			<LinkBase>Services\Platform</LinkBase>
-		</Compile>
-		<Compile Include="..\BD.WTTS.Client\Services\Mvvm\LogConsoleService.Logger.cs">
-			<LinkBase>Services\Mvvm</LinkBase>
+		<Compile Include="..\AssemblyInfo.Constants.cs">
+			<LinkBase>Properties</LinkBase>
 		</Compile>
 	</ItemGroup>
 
@@ -86,19 +71,12 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<Compile Include="..\BD.WTTS.Client.Plugins.Accelerator\Enums\ProxyMode.cs">
-			<LinkBase>Enums</LinkBase>
-		</Compile>
-	</ItemGroup>
-
-	<ItemGroup>
 		<!--<PackageReference Include="BD.Common" />
 		<PackageReference Include="BD.Common.Repositories.SQLitePCL" />-->
 		<ProjectReference Include="..\..\ref\Common\src\BD.Common.Repositories.SQLitePCL\BD.Common.Repositories.SQLitePCL.csproj" />
 		<ProjectReference Include="..\..\ref\Common\src\BD.Common\BD.Common.csproj" />
-		<ProjectReference Include="..\..\ref\dotnetCampus.Ipc\src\dotnetCampus.Ipc.Analyzers\dotnetCampus.Ipc.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
-		<ProjectReference Include="..\..\ref\dotnetCampus.Ipc\src\dotnetCampus.Ipc\dotnetCampus.Ipc.csproj" />
 		<PackageReference Include="NLog" />
+		<PackageReference Include="NLog.Extensions.Logging" />
 		<PackageReference Include="System.Linq.Async" />
 		<PackageReference Include="Ae.DNS.Client" />
 		<PackageReference Include="DNS" />
@@ -114,14 +92,15 @@
 		<PackageReference Include="Utf8StringInterpolation" />
 	</ItemGroup>
 
-	<ItemGroup Condition="!$(DefineConstants.Contains('REMOVE_DNS_INTERCEPT')) AND $([MSBuild]::IsOSPlatform('windows')) AND ($(RuntimeIdentifier.StartsWith('win-')) OR $(RuntimeIdentifier) == '')">
+	<ItemGroup Condition="!$(DefineConstants.Contains('REMOVE_DNS_INTERCEPT')) AND ($([MSBuild]::IsOSPlatform('windows')) OR $(RuntimeIdentifier.StartsWith('win-')))">
 		<PackageReference Include="Aigio.WinDivertSharp" />
+		<!-- DNS 拦截模式需要 WinDivert 驱动，随程序一起输出 -->
+		<None Include="..\..\ref\WinDivert.dll" Link="WinDivert.dll" CopyToOutputDirectory="PreserveNewest" />
+		<None Include="..\..\ref\WinDivert64.sys" Link="WinDivert64.sys" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>
 		<ProjectReference Include="..\..\ref\WTTS.MicroServices.ClientSDK\src\BD.WTTS.MicroServices.Primitives.Models\BD.WTTS.MicroServices.Primitives.Models.csproj" />
-		<ProjectReference Include="..\BD.WTTS.Client.IPC\BD.WTTS.Client.IPC.csproj" />
-		<ProjectReference Include="..\..\ref\dotnetCampus.Ipc\src\dotnetCampus.Ipc.Analyzers\dotnetCampus.Ipc.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
 	</ItemGroup>
 
 	<Import Project="..\OSShuttingDownHelper\OSShuttingDownHelper.projitems" Label="Shared" />

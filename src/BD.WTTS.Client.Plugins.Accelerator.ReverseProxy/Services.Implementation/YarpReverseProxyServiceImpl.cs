@@ -9,31 +9,19 @@ sealed partial class YarpReverseProxyServiceImpl : ReverseProxyServiceImpl, IRev
     static readonly string RootPath = Path.Combine(IOPath.AppDataDirectory, "Yarp");
 
     WebApplication? app;
-    readonly IPCSubProcessService ipc;
     readonly IPCToastService toast;
     readonly IPCPlatformService platformService;
 
     public YarpReverseProxyServiceImpl(
-        IPCSubProcessService ipc,
+        IPCPlatformService platformService,
+        IPCToastService toast,
         DnsAnalysisServiceImpl dnsAnalysisServiceImpl,
         DnsDohAnalysisService dnsDohAnalysisService,
         ICertificateManager certificateManager) : base(dnsAnalysisServiceImpl, dnsDohAnalysisService)
     {
-        this.ipc = ipc;
-        platformService = GetIPCService<IPCPlatformService>(nameof(platformService));
-        toast = GetIPCService<IPCToastService>(nameof(toast));
+        this.platformService = platformService;
+        this.toast = toast;
         CertificateManager = (CertificateManagerImpl)certificateManager;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    TIPCService GetIPCService<TIPCService>(string paramName) where TIPCService : class
-    {
-        var ipcService = ipc.GetService<TIPCService>() ?? throw new ArgumentNullException(paramName);
-        ipcAddSingletonServices += s =>
-        {
-            s.AddSingleton(ipcService);
-        };
-        return ipcService;
     }
 
     public override CertificateManagerImpl CertificateManager { get; }
@@ -247,7 +235,8 @@ sealed partial class YarpReverseProxyServiceImpl : ReverseProxyServiceImpl, IRev
 
     public void Exit()
     {
-        ipc.Dispose();
+        // 独立进程中不存在 IPC 父进程通道，退出由宿主程序负责。
+        Log.Info(TAG, "Exit requested, the host process will shut down.");
     }
 
     public async Task StopProxyAsync()

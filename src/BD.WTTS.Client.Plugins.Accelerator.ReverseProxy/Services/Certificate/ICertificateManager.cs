@@ -1,4 +1,3 @@
-using dotnetCampus.Ipc.CompilerServices.Attributes;
 using Const = BD.WTTS.Constants;
 
 // ReSharper disable once CheckNamespace
@@ -7,7 +6,6 @@ namespace BD.WTTS.Services;
 /// <summary>
 /// 证书管理(安装/卸载)
 /// </summary>
-[IpcPublic(Timeout = AssemblyInfo.IpcTimeout, IgnoresIpcException = false)]
 public interface ICertificateManager
 {
     static class Constants

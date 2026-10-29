@@ -7,15 +7,13 @@ sealed partial class CertificateManagerImpl : ICertificateManager
 
     ICertificateManager Interface => this;
 
-    readonly IPCSubProcessService ipc;
     readonly IPCPlatformService platformService;
     readonly IPCToastService toast;
 
-    public CertificateManagerImpl(IPCSubProcessService ipc)
+    public CertificateManagerImpl(IPCPlatformService platformService, IPCToastService toast)
     {
-        this.ipc = ipc;
-        platformService = ipc.GetService<IPCPlatformService>().ThrowIsNull(nameof(platformService));
-        toast = ipc.GetService<IPCToastService>().ThrowIsNull(nameof(toast));
+        this.platformService = platformService;
+        this.toast = toast;
     }
 
     /// <inheritdoc cref="ICertificateManager.RootCertificate"/>

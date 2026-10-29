@@ -5,8 +5,6 @@ namespace BD.WTTS.Services.Implementation;
 
 partial class YarpReverseProxyServiceImpl
 {
-    Action<IServiceCollection>? ipcAddSingletonServices;
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void StartupConfigureServices(IServiceCollection services)
     {
@@ -30,10 +28,9 @@ partial class YarpReverseProxyServiceImpl
         }
 #endif
 
-        // !!! 不可将 IPCSubProcessService ipc 添加到 YarpHost 的 DI 容器中，因停止加速时执行释放会导致进程退出
-        //services.AddSingleton(_ => ipc);
-
-        ipcAddSingletonServices?.Invoke(services);
+        // YarpHost 使用独立的 DI 容器，DomainResolver 需要在此容器中解析 IPCToastService
+        services.AddSingleton(platformService);
+        services.AddSingleton(toast);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

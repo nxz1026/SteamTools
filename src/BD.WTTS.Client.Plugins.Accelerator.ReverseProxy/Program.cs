@@ -1,13 +1,47 @@
 using BD.Common.Repositories.Abstractions;
-using dotnetCampus.Ipc.CompilerServices.GeneratedProxies;
-using Windows.Win32;
+using BD.WTTS.Enums;
+using BD.WTTS.Models;
+using BD.WTTS.Services.Implementation;
+using System.Text;
+using System.Text.Json;
 using KeyValuePair = BD.Common.Entities.KeyValuePair;
 
+// ============================================================================
+// Steam++ Accelerator —— 仅代理（反向代理）独立宿主程序
+//
+// 本程序由 Watt Toolkit(Steam++) 裁剪而来，只保留「网络加速 / 反向代理」能力。
+// 它不再作为 GUI 主程序的 IPC 子进程运行，因此可以独立启动、退出与配置。
+//
+// 用法:
+//   Steam++.Accelerator --mode system [--port 26501] [--ip 127.0.0.1]
+//   Steam++.Accelerator --mode hosts
+//   Steam++.Accelerator --mode pac
+//   Steam++.Accelerator --mode dns            (需要管理员权限 + WinDivert)
+//   Steam++.Accelerator --mode proxyonly
+//
+//   --mode   system(默认) | hosts | pac | dns | proxyonly
+//   --port   代理监听端口，默认 26501；hosts 模式默认 443
+//   --ip     监听地址，默认 127.0.0.1（如需局域网共享请改成 0.0.0.0）
+//   --dns    上游 DNS，默认 223.5.5.5
+//   --no-doh 关闭 DoH（默认启用 DoH）
+//   --all    启用官方规则里的全部项目（默认只启用服务端标记为已勾选的项目）
+//   --help   显示帮助
+// ============================================================================
+
 const string moduleName = AssemblyInfo.Accelerator;
-const string pluginName = AssemblyInfo.Accelerator;
+const string tag = "Accelerator";
+
+// 官方加速规则接口（匿名可用，无需登录账号）
+const string apiBaseUrl = "https://api.steampp.net";
+const string accelerateProjectGroupsPath = "/accelerator/projectgroups";
+
+const ushort defaultProxyPort = 26501;
+const ushort hostsProxyPort = 443;
+const string defaultProxyDns = "223.5.5.5";
+const string defaultProxyIp = "127.0.0.1";
+
 #if DEBUG
-//Console.WriteLine($"This: {moduleName} / Program.Start");
-var consoleTitle = $"[{Environment.ProcessId}, {IsProcessElevated_DEBUG_Only().ToLowerString()}] {Constants.CUSTOM_URL_SCHEME_NAME}({moduleName}) {string.Join(' ', Environment.GetCommandLineArgs().Skip(1))}";
+var consoleTitle = $"[{Environment.ProcessId}, {IsProcessElevated_DEBUG_Only().ToLowerString()}] {Constants.CUSTOM_URL_SCHEME_NAME}({moduleName}) {string.Join(' ', args)}";
 SetConsoleTitle(consoleTitle);
 
 [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -19,7 +53,6 @@ static void SetConsoleTitle(string title)
     }
     catch
     {
-
     }
 }
 
@@ -30,53 +63,260 @@ static bool IsProcessElevated_DEBUG_Only()
     {
         return false;
     }
-    // use WindowsPlatformServiceImpl.IsProcessElevated on not Debug
     using WindowsIdentity identity = WindowsIdentity.GetCurrent();
     WindowsPrincipal principal = new(identity);
     return principal.IsInRole(WindowsBuiltInRole.Administrator);
 }
 #endif
 
-if (OSShuttingDownHelper.IsSystemShuttingDown())
+if (Windows.Win32.OSShuttingDownHelper.IsSystemShuttingDown())
 {
     return 0;
 }
 
+var cli = ParseArgs(args);
+
+if (cli.ContainsKey("help"))
+{
+    PrintUsage();
+    return 0;
+}
+
+var proxyModeText = (cli.GetValueOrDefault("mode") ?? "system").Trim().ToLowerInvariant();
+var proxyMode = proxyModeText switch
+{
+    "system" => ProxyMode.System,
+    "hosts" => ProxyMode.Hosts,
+    "pac" => ProxyMode.PAC,
+    "dns" or "dnsintercept" => ProxyMode.DNSIntercept,
+    "proxyonly" or "proxy" => ProxyMode.ProxyOnly,
+    _ => ProxyMode.System,
+};
+
+var proxyPort = cli.TryGetValue("port", out var portText) && ushort.TryParse(portText, out var portValue) && portValue > 0
+    ? portValue
+    : proxyMode == ProxyMode.Hosts ? hostsProxyPort : defaultProxyPort;
+
+var proxyIp = GetString(cli, "ip") ?? defaultProxyIp;
+var proxyDns = GetString(cli, "dns") ?? defaultProxyDns;
+var useDoh = !cli.ContainsKey("no-doh");
+var loadAllRules = cli.ContainsKey("all");
+
+var exitCode = 0;
+var sideEffectApplied = false;
+
+// 宿主目录必须在使用 IOPath.AppDataDirectory 之前初始化
+IOPath.InitFileSystem(GetAppDataDirectory, GetCacheDirectory);
+InitNLog();
+
+Console.WriteLine($"{Constants.CUSTOM_URL_SCHEME_NAME} Accelerator");
+Console.WriteLine($"  mode      : {proxyMode} ({proxyModeText})");
+Console.WriteLine($"  listen    : {proxyIp}:{proxyPort}");
+Console.WriteLine($"  dns       : {proxyDns}{(useDoh ? " (DoH)" : string.Empty)}");
+Console.WriteLine($"  appdata   : {IOPath.AppDataDirectory}");
+Console.WriteLine();
+
 try
 {
-    var exitCode = await IPCSubProcessService.MainAsync(moduleName, pluginName, ConfigureServices, static ipcProvider =>
-    {
-        VisualStudioAppCenterSDK.Init();
+    // 使用 BD.Common 的 Ioc 容器，引擎内部的 Ioc.Get<T>() 依赖它
+    Ioc.ConfigureServices(ConfigureServices);
 
-        // 添加反向代理服务（供主进程的 IPC 远程访问）
-        ipcProvider.CreateIpcJoint(LazyReverseProxyServiceImpl.Instance);
-        ipcProvider.CreateIpcJoint(LazyCertificateManager.Instance);
-    }, args);
+    var reverseProxyService = Ioc.Get<IReverseProxyService>();
 
-#if DEBUG
-    if (exitCode != default)
+    var proxyDomains = await LoadAccelerateProjectsAsync(loadAllRules);
+    if (proxyDomains.Count <= 0)
     {
-        Console.ReadLine();
+        Console.Error.WriteLine("未能获取任何加速规则（在线接口与本地缓存都不可用），代理将以「无规则直连」方式启动。");
     }
-#endif
-    return exitCode;
+    else
+    {
+        Console.WriteLine($"已加载 {proxyDomains.Count} 条加速规则。");
+    }
+
+    var settings = new ReverseProxySettings(
+        ProxyDomains: proxyDomains,
+        Scripts: null,
+        IsEnableScript: false,
+        IsOnlyWorkSteamBrowser: false,
+        ProxyPort: proxyPort,
+        ProxyIp: proxyIp,
+        ProxyMode: proxyMode,
+        IsProxyGOG: false,
+        OnlyEnableProxyScript: false,
+        EnableHttpProxyToHttps: true,
+        Socks5ProxyEnable: false,
+        Socks5ProxyPortId: 8868,
+        TwoLevelAgentEnable: false,
+        TwoLevelAgentProxyType: ExternalProxyType.Socks5,
+        TwoLevelAgentIp: "127.0.0.1",
+        TwoLevelAgentPortId: 7890,
+        TwoLevelAgentUserName: null,
+        TwoLevelAgentPassword: null,
+        ProxyDNS: proxyDns,
+        IsSupportIpv6: Socket.OSSupportsIPv6,
+        UseDoh: useDoh,
+        CustomDohAddres: null,
+        ServerSideProxyToken: null);
+
+    var startResult = await reverseProxyService.StartProxyAsync(Serializable.SMP2(settings));
+    if (startResult.Code != StartProxyResultCode.Ok)
+    {
+        Console.Error.WriteLine($"启动代理失败: {startResult.Code}({(byte)startResult.Code})");
+        if (startResult.Exception != null)
+        {
+            Console.Error.WriteLine(startResult.Exception.ToString());
+        }
+        return 3;
+    }
+
+    Console.WriteLine($"代理引擎已启动，监听模式 {proxyMode}。");
+
+    // 按模式应用「系统级副作用」——引擎只负责代理与拦截本身
+    switch (proxyMode)
+    {
+        case ProxyMode.System:
+            sideEffectApplied = await SystemProxyHelper.SetSystemProxyAsync(true, proxyIp, proxyPort);
+            break;
+        case ProxyMode.PAC:
+            sideEffectApplied = await SystemProxyHelper.SetPacAsync(true, $"http://{proxyIp}:{proxyPort}/proxy.pac");
+            break;
+        case ProxyMode.Hosts:
+            sideEffectApplied = await HostsFileHelper.ApplyAsync(proxyDomains, "127.0.0.1");
+            break;
+        case ProxyMode.DNSIntercept:
+            // DNS 拦截由 WinDivert 驱动完成，需要管理员权限
+            Console.WriteLine("DNS 拦截模式：请确认以管理员身份运行，且 WinDivert.dll / WinDivert64.sys 与程序同目录。");
+            sideEffectApplied = true;
+            break;
+        case ProxyMode.ProxyOnly:
+            Console.WriteLine($"仅代理模式：请把客户端代理指向 http://{proxyIp}:{proxyPort}");
+            sideEffectApplied = true;
+            break;
+    }
+
+    Console.WriteLine(sideEffectApplied ? "已应用系统设置。" : "警告：应用系统设置失败，请检查权限。");
+    Console.WriteLine("按 Ctrl+C 停止并退出。");
+    Console.WriteLine();
+
+    // 注意：不能使用 using，ProcessExit 处理器在 CTS 释放后仍可能被回调
+    var shutdown = new CancellationTokenSource();
+    void RequestShutdown()
+    {
+        try
+        {
+            shutdown.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 进程退出阶段 CTS 已释放，忽略
+        }
+    }
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        RequestShutdown();
+    };
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => RequestShutdown();
+    try
+    {
+        await Task.Delay(Timeout.Infinite, shutdown.Token);
+    }
+    catch (OperationCanceledException)
+    {
+    }
+
+    Console.WriteLine("正在停止代理...");
+
+    // 先撤销系统级副作用，再停止引擎
+    switch (proxyMode)
+    {
+        case ProxyMode.System:
+            await SystemProxyHelper.SetSystemProxyAsync(false, null, 0);
+            break;
+        case ProxyMode.PAC:
+            await SystemProxyHelper.SetPacAsync(false, null);
+            break;
+        case ProxyMode.Hosts:
+            await HostsFileHelper.RevertAsync();
+            break;
+    }
+
+    await reverseProxyService.StopProxyAsync();
+    Console.WriteLine("已退出。");
 }
 catch (Exception ex)
 {
-    Console.WriteLine(ex.ToString());
-    Console.ReadLine();
-    return 500;
+    Console.Error.WriteLine(ex.ToString());
+    exitCode = 500;
 }
 finally
 {
     try
     {
-        VisualStudioAppCenterSDK.UtilsImpl.Instance.OnExit(null, EventArgs.Empty);
+        await Ioc.DisposeAsync();
     }
     catch
     {
-
     }
+#if DEBUG
+    Console.ReadLine();
+#endif
+}
+
+return exitCode;
+
+// ---------------------------------------------------------------------------
+// 宿主基础设置
+// ---------------------------------------------------------------------------
+
+static string GetAppDataDirectory()
+{
+    var root = OperatingSystem.IsWindows()
+        ? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+        : Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+    if (string.IsNullOrWhiteSpace(root))
+    {
+        root = AppContext.BaseDirectory;
+    }
+    var dir = Path.Combine(root, "Steam++Accelerator");
+    Directory.CreateDirectory(dir);
+    return dir;
+}
+
+static string GetCacheDirectory()
+{
+    var dir = Path.Combine(GetAppDataDirectory(), "Cache");
+    Directory.CreateDirectory(dir);
+    return dir;
+}
+
+static void InitNLog()
+{
+    var logDirectory = Path.Combine(IOPath.CacheDirectory, "Logs");
+    Directory.CreateDirectory(logDirectory);
+
+    var layout = "${longdate}|${level:uppercase=true}|${logger:shortName=true}|${message} ${exception:format=tostring}";
+
+    var configuration = new LoggingConfiguration();
+
+    var consoleTarget = new ColoredConsoleTarget("console")
+    {
+        Layout = layout,
+    };
+    configuration.AddRule(NLogLevel.Info, NLogLevel.Fatal, consoleTarget);
+
+    var fileTarget = new FileTarget("file")
+    {
+        FileName = Path.Combine(logDirectory, $"accelerator-${{shortdate}}.log"),
+        Layout = layout,
+        ArchiveAboveSize = 10 * 1024 * 1024,
+        MaxArchiveFiles = 14,
+        KeepFileOpen = false,
+    };
+    configuration.AddRule(NLogLevel.Debug, NLogLevel.Fatal, fileTarget);
+
+    NLogManager.Configuration = configuration;
 }
 
 static void ConfigureServices(IServiceCollection services)
@@ -85,9 +325,7 @@ static void ConfigureServices(IServiceCollection services)
     {
         l.ClearProviders();
         l.AddNLog(LogManager.Configuration!); // 添加 NLog 日志
-#if DEBUG
         l.AddConsole();
-#endif
         l.AddProvider(new LogConsoleService.Utf8StringLoggerProvider(moduleName));
     });
 
@@ -99,11 +337,149 @@ static void ConfigureServices(IServiceCollection services)
     services.AddCommonHttpClientFactory();
     services.AddSingleton<IHttpPlatformHelperService, HttpPlatformHelperConsoleService>();
 
+    // 本机实现，替代原来由 IPC 主进程提供的平台/提示服务
+    services.AddSingleton<IPCPlatformService, IPCPlatformServiceImpl>();
+    services.AddSingleton<IPCToastService, IPCToastServiceImpl>();
+
     services.AddDnsAnalysisService();
-    // 添加反向代理服务（子进程实现）
     services.AddReverseProxyService();
     services.AddSingleton<ICertificateManager, CertificateManagerImpl>();
 }
+
+// ---------------------------------------------------------------------------
+// 加速规则：官方接口（匿名）+ 本地 JSON 缓存兜底
+// ---------------------------------------------------------------------------
+
+static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsync(bool all)
+{
+    var cacheFilePath = Path.Combine(IOPath.AppDataDirectory, "accelerate-projects.json");
+
+    try
+    {
+        using var http = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(30),
+        };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd(HttpPlatformHelperConsoleService.DefaultUserAgent);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, apiBaseUrl + accelerateProjectGroupsPath)
+        {
+            Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content.ReadAsStringAsync();
+        var projects = ParseAccelerateProjects(json, all);
+        if (projects.Count > 0)
+        {
+            await File.WriteAllTextAsync(cacheFilePath, json, Encoding.UTF8);
+            return projects;
+        }
+    }
+    catch (Exception ex)
+    {
+        Log.Warn(tag, $"从官方接口获取加速规则失败: {ex.Message}");
+    }
+
+    try
+    {
+        if (File.Exists(cacheFilePath))
+        {
+            var json = await File.ReadAllTextAsync(cacheFilePath);
+            var projects = ParseAccelerateProjects(json, all);
+            if (projects.Count > 0)
+            {
+                Console.WriteLine("已使用本地缓存的加速规则。");
+                return projects;
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Log.Warn(tag, $"读取本地加速规则缓存失败: {ex.Message}");
+    }
+
+    return Array.Empty<AccelerateProjectDTO>();
+}
+
+static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(string json, bool all)
+{
+    var rsp = JsonSerializer.Deserialize<ApiRsp<List<AccelerateProjectGroupDTO>>>(json);
+    var groups = rsp?.Content;
+    if (groups == null || groups.Count <= 0)
+    {
+        return Array.Empty<AccelerateProjectDTO>();
+    }
+
+    var projects = groups
+        .SelectMany(x => x.Items ?? new List<AccelerateProjectDTO>())
+        .ToArray();
+
+    if (all)
+    {
+        return projects;
+    }
+
+    // 默认只启用服务端标记为已勾选的项目；若接口没有回传勾选状态则全部启用
+    var checkedProjects = projects.Where(x => x.Checked).ToArray();
+    return checkedProjects.Length > 0 ? checkedProjects : projects;
+}
+
+// ---------------------------------------------------------------------------
+// 命令行
+// ---------------------------------------------------------------------------
+
+static Dictionary<string, string?> ParseArgs(string[] args)
+{
+    var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+    for (var i = 0; i < args.Length; i++)
+    {
+        var arg = args[i];
+        if (!arg.StartsWith("--"))
+        {
+            continue;
+        }
+        var key = arg[2..];
+        string? value = null;
+        if (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+        {
+            value = args[i + 1];
+            i++;
+        }
+        result[key] = value;
+    }
+    return result;
+}
+
+static string? GetString(Dictionary<string, string?> cli, string key)
+    => cli.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : null;
+
+static void PrintUsage()
+{
+    Console.WriteLine($"{Constants.CUSTOM_URL_SCHEME_NAME} Accelerator —— 仅代理（反向代理）独立宿主程序");
+    Console.WriteLine();
+    Console.WriteLine("用法: Steam++.Accelerator [选项]");
+    Console.WriteLine();
+    Console.WriteLine("  --mode <system|hosts|pac|dns|proxyonly>  运行模式，默认 system");
+    Console.WriteLine("      system      设置 Windows 系统代理（推荐）");
+    Console.WriteLine("      hosts       改写 hosts 并本地反向代理（需要管理员）");
+    Console.WriteLine("      pac         通过 PAC 脚本分流");
+    Console.WriteLine("      dns         WinDivert 驱动级 DNS 拦截（需要管理员）");
+    Console.WriteLine("      proxyonly   只启动反向代理，不修改任何系统设置");
+    Console.WriteLine("  --port <端口>                            代理监听端口，默认 26501（hosts 模式 443）");
+    Console.WriteLine("  --ip <地址>                              监听地址，默认 127.0.0.1");
+    Console.WriteLine("  --dns <地址>                             上游 DNS，默认 223.5.5.5");
+    Console.WriteLine("  --no-doh                                 关闭 DoH");
+    Console.WriteLine("  --all                                    启用官方规则中的全部项目（默认仅启用服务端已勾选项）");
+    Console.WriteLine("  --help                                   显示帮助");
+}
+
+// ---------------------------------------------------------------------------
+// 本地服务实现
+// ---------------------------------------------------------------------------
 
 sealed class RepositorySecureStorage : Repository<KeyValuePair, string>, ISecureStorage
 {
@@ -160,7 +536,231 @@ sealed class RepositorySecureStorage : Repository<KeyValuePair, string>, ISecure
 
 sealed class HttpPlatformHelperConsoleService : HttpPlatformHelperService
 {
-    new const string DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36 Edg/90.0.818.51";
+    public new const string DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36 Edg/90.0.818.51";
 
     public override string UserAgent => DefaultUserAgent;
+}
+
+// ---------------------------------------------------------------------------
+// Windows 系统代理 / PAC
+// ---------------------------------------------------------------------------
+
+static class SystemProxyHelper
+{
+    const string TAG = "SystemProxy";
+
+    const string RegistryHeader = "Windows Registry Editor Version 5.00";
+
+    const string InternetSettingsKey = @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    /// <summary>不使用代理的地址，与上游保持一致（本地与内网直连）。</summary>
+    const string ProxyOverride = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
+
+    public static Task<bool> SetSystemProxyAsync(bool state, string? ip, int port)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Log.Warn(TAG, "系统代理设置仅支持 Windows。");
+            return Task.FromResult(false);
+        }
+
+        var proxyEnable = $"\"ProxyEnable\"=dword:{(state ? "00000001" : "00000000")}";
+        var proxyServer = state && !string.IsNullOrWhiteSpace(ip) && port > 0
+            ? $"\"ProxyServer\"=\"{ip}:{port}\""
+            : "\"ProxyServer\"=\"\"";
+        var proxyOverride = state ? $"\"ProxyOverride\"=\"{ProxyOverride}\"" : string.Empty;
+
+        var contents =
+$"""
+{RegistryHeader}
+
+[{InternetSettingsKey}]
+{proxyEnable}
+{proxyServer}
+{(string.IsNullOrEmpty(proxyOverride) ? string.Empty : proxyOverride)}
+""";
+
+        return WriteRegistryAsync("SwitchProxy.reg", contents);
+    }
+
+    public static Task<bool> SetPacAsync(bool state, string? url)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Log.Warn(TAG, "PAC 设置仅支持 Windows。");
+            return Task.FromResult(false);
+        }
+
+        var autoConfigUrl = state && !string.IsNullOrWhiteSpace(url)
+            ? $"\"AutoConfigURL\"=\"{url}\""
+            : "\"AutoConfigURL\"=\"\"";
+
+        var contents =
+$"""
+{RegistryHeader}
+
+[{InternetSettingsKey}]
+{autoConfigUrl}
+""";
+
+        return WriteRegistryAsync("SwitchPacProxy.reg", contents);
+    }
+
+    static async Task<bool> WriteRegistryAsync(string fileName, string contents)
+    {
+        try
+        {
+            var path = Path.Combine(IOPath.CacheDirectory, fileName);
+            await File.WriteAllTextAsync(path, contents, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            // HKCU 无需管理员权限；regedit /s 静默导入
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.System),
+                    "regedit.exe"),
+                Arguments = $"/s \"{path}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var process = Process.Start(startInfo);
+            if (process != null)
+            {
+                await process.WaitForExitAsync();
+            }
+
+            RefreshWinINet();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(TAG, ex.ToString());
+            return false;
+        }
+    }
+
+    const int InternetOptionRefresh = 37;
+    const int InternetOptionSettingsChanged = 39;
+
+    [DllImport("wininet.dll", SetLastError = true)]
+    static extern bool InternetSetOption(nint hInternet, int dwOption, nint lpBuffer, int dwBufferLength);
+
+    /// <summary>通知 WinINet 配置已变化，避免必须重启浏览器/系统才生效。</summary>
+    static void RefreshWinINet()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        try
+        {
+            InternetSetOption(default, InternetOptionSettingsChanged, default, 0);
+            InternetSetOption(default, InternetOptionRefresh, default, 0);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(TAG, ex.Message);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hosts 文件改写（hosts 模式）
+// ---------------------------------------------------------------------------
+
+static class HostsFileHelper
+{
+    const string TAG = "Hosts";
+
+    const string BeginTag = "# --- Steam++Accelerator BEGIN ---";
+    const string EndTag = "# --- Steam++Accelerator END ---";
+
+    static string GetHostsFilePath()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var system32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            if (!string.IsNullOrWhiteSpace(system32))
+            {
+                return Path.Combine(system32, "drivers", "etc", "hosts");
+            }
+        }
+        return "/etc/hosts";
+    }
+
+    public static async Task<bool> ApplyAsync(IEnumerable<AccelerateProjectDTO> projects, string ip)
+    {
+        try
+        {
+            var domains = projects
+                .SelectMany(x => (x.ListenDomainNames ?? x.MatchDomainNames ?? string.Empty).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Where(x => x.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (domains.Length <= 0)
+            {
+                Log.Warn(TAG, "没有可写入 hosts 的域名。");
+                return false;
+            }
+
+            var lines = new List<string>
+            {
+                BeginTag,
+                "# 由 Steam++ Accelerator 自动生成，请勿手动修改",
+            };
+            lines.AddRange(domains.Select(x => $"{ip} {x}"));
+            lines.Add(EndTag);
+
+            return await UpdateAsync(lines);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(TAG, ex.ToString());
+            return false;
+        }
+    }
+
+    public static Task<bool> RevertAsync() => UpdateAsync(Array.Empty<string>());
+
+    static async Task<bool> UpdateAsync(IReadOnlyList<string> block)
+    {
+        try
+        {
+            var hostsFilePath = GetHostsFilePath();
+            if (!File.Exists(hostsFilePath))
+            {
+                Log.Error(TAG, $"hosts 文件不存在: {hostsFilePath}");
+                return false;
+            }
+
+            var content = await File.ReadAllTextAsync(hostsFilePath);
+            var lines = content.Replace("\r\n", "\n").Split('\n').ToList();
+
+            var beginIndex = lines.FindIndex(x => x.Trim() == BeginTag);
+            var endIndex = lines.FindIndex(x => x.Trim() == EndTag);
+            if (beginIndex >= 0 && endIndex > beginIndex)
+            {
+                lines.RemoveRange(beginIndex, endIndex - beginIndex + 1);
+            }
+
+            if (block.Count > 0)
+            {
+                var insertIndex = lines.FindLastIndex(x => !string.IsNullOrWhiteSpace(x)) + 1;
+                lines.InsertRange(insertIndex, block);
+            }
+
+            var result = string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine;
+            await File.WriteAllTextAsync(hostsFilePath, result, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            Log.Info(TAG, $"hosts 已更新: {hostsFilePath} ({block.Count} 行)");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(TAG, ex.ToString());
+            return false;
+        }
+    }
 }
