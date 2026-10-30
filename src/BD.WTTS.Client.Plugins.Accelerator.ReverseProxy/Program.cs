@@ -110,6 +110,24 @@ var proxyDns = GetString(cli, "dns") ?? defaultProxyDns;
 var useDoh = !cli.ContainsKey("no-doh");
 var loadAllRules = cli.ContainsKey("all");
 
+// --exclude 可重复，按加速项目名排除规则（直接从原始参数扫描，避免被参数字典覆盖）
+var excludedRuleNames = new List<string>();
+for (var i = 0; i < args.Length; i++)
+{
+    if (!args[i].Equals("--exclude", StringComparison.OrdinalIgnoreCase))
+    {
+        continue;
+    }
+    if (i + 1 >= args.Length)
+    {
+        continue;
+    }
+    foreach (var item in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
+        excludedRuleNames.Add(item);
+    }
+}
+
 var exitCode = 0;
 var sideEffectApplied = false;
 
@@ -131,7 +149,7 @@ try
 
     var reverseProxyService = Ioc.Get<IReverseProxyService>();
 
-    var proxyDomains = await LoadAccelerateProjectsAsync(loadAllRules);
+    var proxyDomains = await LoadAccelerateProjectsAsync(loadAllRules, excludedRuleNames);
     if (proxyDomains.Count <= 0)
     {
         Console.Error.WriteLine("未能获取任何加速规则（在线接口与本地缓存都不可用），代理将以「无规则直连」方式启动。");
@@ -358,7 +376,9 @@ static void ConfigureServices(IServiceCollection services)
 // 加速规则：官方接口（匿名）+ 本地 JSON 缓存兜底
 // ---------------------------------------------------------------------------
 
-static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsync(bool all)
+static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsync(
+    bool all,
+    IReadOnlyCollection<string> excludes)
 {
     var cacheFilePath = Path.Combine(IOPath.AppDataDirectory, "accelerate-projects.json");
 
@@ -380,7 +400,7 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync();
-        var projects = ParseAccelerateProjects(json, all);
+        var projects = ParseAccelerateProjects(json, all, excludes);
         if (projects.Count > 0)
         {
             await File.WriteAllTextAsync(cacheFilePath, json, Encoding.UTF8);
@@ -397,7 +417,7 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
         if (File.Exists(cacheFilePath))
         {
             var json = await File.ReadAllTextAsync(cacheFilePath);
-            var projects = ParseAccelerateProjects(json, all);
+            var projects = ParseAccelerateProjects(json, all, excludes);
             if (projects.Count > 0)
             {
                 Console.WriteLine("已使用本地缓存的加速规则。");
@@ -413,7 +433,10 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
     return Array.Empty<AccelerateProjectDTO>();
 }
 
-static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(string json, bool all)
+static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(
+    string json,
+    bool all,
+    IReadOnlyCollection<string> excludes)
 {
     var rsp = JsonSerializer.Deserialize<ApiRsp<List<AccelerateProjectGroupDTO>>>(json);
     var groups = rsp?.Content;
@@ -428,12 +451,26 @@ static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(string json, 
 
     if (all)
     {
+        projects = projects.ToArray();
+    }
+    else
+    {
+        // 默认只启用服务端标记为已勾选的项目；若接口没有回传勾选状态则全部启用
+        var checkedProjects = projects.Where(x => x.Checked).ToArray();
+        projects = checkedProjects.Length > 0 ? checkedProjects : projects;
+    }
+
+    if (excludes.Count <= 0)
+    {
         return projects;
     }
 
-    // 默认只启用服务端标记为已勾选的项目；若接口没有回传勾选状态则全部启用
-    var checkedProjects = projects.Where(x => x.Checked).ToArray();
-    return checkedProjects.Length > 0 ? checkedProjects : projects;
+    // --exclude 按项目名排除（不区分大小写）。用于剔除规则集中会把常用域名劫持到
+    // 非预期目标的项，例如「Google(Recaptcha) 验证码」会把 google.com 转发到 recaptcha.net。
+    return projects
+        .Where(x => !excludes.Any(e =>
+            string.Equals(e, x.Name, StringComparison.OrdinalIgnoreCase)))
+        .ToArray();
 }
 
 // ---------------------------------------------------------------------------
@@ -473,15 +510,16 @@ static void PrintUsage()
     Console.WriteLine();
     Console.WriteLine("  --mode <system|hosts|pac|dns|proxyonly>  运行模式，默认 system");
     Console.WriteLine("      system      设置 Windows 系统代理（推荐）");
-    Console.WriteLine("      hosts       改写 hosts 并本地反向代理（需要管理员）");
+    Console.WriteLine("      hosts       改写 hosts 并本地反向代理（监听 443）");
     Console.WriteLine("      pac         通过 PAC 脚本分流");
     Console.WriteLine("      dns         WinDivert 驱动级 DNS 拦截（需要管理员）");
     Console.WriteLine("      proxyonly   只启动反向代理，不修改任何系统设置");
-    Console.WriteLine("  --port <端口>                            代理监听端口，默认 26501（hosts 模式 443）");
+    Console.WriteLine("  --port <端口>                            代理监听端口，默认 26501（hosts / dns 模式固定 443）");
     Console.WriteLine("  --ip <地址>                              监听地址，默认 127.0.0.1");
     Console.WriteLine("  --dns <地址>                             上游 DNS，默认 223.5.5.5");
     Console.WriteLine("  --no-doh                                 关闭 DoH");
-    Console.WriteLine("  --all                                    启用官方规则中的全部项目（默认仅启用服务端已勾选项）");
+    Console.WriteLine("  --all                                    启用官方规则里的全部项目（默认仅启用服务端已勾选项）");
+    Console.WriteLine("  --exclude <项目名>[,<项目名>...]        按项目名排除规则，可重复指定");
     Console.WriteLine("  --help                                   显示帮助");
 }
 

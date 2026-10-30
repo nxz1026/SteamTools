@@ -76,7 +76,8 @@ Steam++.Accelerator.exe [选项]
   --ip <地址>                              监听地址，默认 127.0.0.1
   --dns <地址>                             上游 DNS，默认 223.5.5.5
   --no-doh                                 关闭 DoH
-  --all                                    启用官方规则中的全部项目（默认仅启用服务端已勾选项）
+  --all                                    启用官方规则里的全部项目（默认仅启用服务端已勾选项）
+  --exclude <项目名>[,<项目名>...]        按项目名排除规则，可重复指定
   --help                                   显示帮助
 ```
 
@@ -112,7 +113,27 @@ Content-Type: application/json
 ```
 
 成功后原始 JSON 会缓存到数据目录下的 `accelerate-projects.json`，接口不可用时用该缓存兜底。
-接口默认只标记少数项目为启用（`Checked`），加 `--all` 可启用返回的全部项目。
+
+接口共返回 58 个加速项目，服务端标记 `Checked=true` 的只有 5 个，且**全部是 Steam 相关**——
+GitHub 的 12 条规则默认都是 `Checked=false`。所以：
+
+- 只加速 Steam → 不加 `--all`
+- 还要加速 GitHub → 加 `--all`
+
+`--all` 会带上一条有害规则，需要用 `--exclude` 排除：
+
+| 项目名 | 匹配域名 | 转发目标 | 后果 |
+|---|---|---|---|
+| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | Google 首页变成 404 |
+
+```bash
+Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
+```
+
+`--exclude` 按**项目名**匹配（不区分大小写），可重复指定，也可用逗号分隔多个。
+
+> 注意：规则的匹配字段是 `MatchDomainNames`，按 `^` 锚定的正则匹配，因此
+> `raw.githubusercontent.com` 这类域名不在规则的匹配范围内，走直连，不受影响。
 
 ## 数据目录与日志
 

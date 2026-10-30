@@ -107,7 +107,17 @@ Content-Type: application/json
 - 响应是 emoji 键的包装结构：`{"🦓": [...], "🦄": 200, "🐴": null}`，对应 `ApiRsp<T>.Content / Code / Message`，
   正文为 PascalCase，`System.Text.Json` 默认配置即可反序列化；
 - 按组拍平后取 `Checked == true` 的项目，默认约 58 个项目中只有 5 个被标记启用，加 `--all` 可全部启用；
+- **这 5 个默认项全部是 Steam 相关**，GitHub 的 12 条规则服务端标记的都是 `Checked == false`。
+  要加速 GitHub 必须加 `--all`；
+- `--all` 会带上一条有害规则：`Google(Recaptcha) 验证码` 的 `MatchDomainNames` 是 `google.com`、
+  `ForwardDomainNames` 是 `www.recaptcha.net`，命中后 Google 首页会变成 404。
+  新增 `--exclude <项目名>` 选项按项目名排除规则（不区分大小写，可重复指定），默认用法：
+  ```
+  Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
+  ```
 - 原始 JSON 缓存在 `<数据目录>/accelerate-projects.json`，接口不可用时用缓存兜底。
+- 规则的匹配字段是 `MatchDomainNames`，`DomainPattern` 用 `^` 锚定的正则匹配，
+  因此 `raw.githubusercontent.com` 这类域名不在匹配范围内，走直连。
 
 ## 5. 跨平台条件编译
 
@@ -149,6 +159,7 @@ WinDivert 包也不会被引入）。改成「或 RID 以 `win-` 开头」后，
 | `--mode pac --port 26591` | 写入 `AutoConfigURL=http://127.0.0.1:26591/proxy.pac`；`/proxy.pac` 返回 PAC 脚本；`Ctrl+C` 退出后该项被删除 |
 | `--mode hosts --port 26554` | 在 hosts 标记块内写入 15 个域名，保留文件 BOM 与 CRLF；`Ctrl+C` 退出后 hosts 文件与运行前**字节级一致** |
 | `--mode dns`（非管理员） | 引擎按预期报 `Win32Exception(5) 拒绝访问` 并中止启动（加载驱动需要管理员权限） |
+| `--mode dns`（管理员） | 成功加载 WinDivert；`store.steampowered.com` / `api.github.com` / `steamcommunity.com` / `github.com` 的 DNS 应答被改写为 `127.0.0.1` / `::1`；经本机 443 反代访问上述站点均返回 200 |
 | 加速命中验证 | 本机 DNS 对 `steamcommunity.com` 返回被污染的 `162.125.1.8`，直连失败（`code=000`）；经代理命中加速节点后返回 200 |
 
 加速生效的直接证据：`steamcommunity.com` 的加速节点 `steamcommunity.rmbgame.net` 解析到 `23.200.230.67`，
@@ -165,6 +176,7 @@ WinDivert 包也不会被引入）。改成「或 RID 以 `win-` 开头」后，
 | `--port` 在 proxyonly 模式被忽略 | 引擎把 proxyonly 归入反向代理分支，固定监听 `443` / `80`，客户端按提示连 `--port` 必然失败 | 引擎侧把 proxyonly 按 System 处理，系统副作用仍一个都不施加 |
 | hosts 写入破坏原文件 | `ReadAllTextAsync` 会剥掉 BOM、把用户已有的非 ASCII 注释写成乱码，并吞掉文件末尾空行；撤销后文件与原文件不一致 | 改为 Latin-1 字节保真读写，且只替换标记块；撤销后文件与原文件字节级一致 |
 | hosts 域名取值错误 | `ListenDomainNames ?? MatchDomainNames` 中前者是非空字符串，`??` 永不生效；`ListenDomainNames` 为空时静默丢域名 | 改用上游同源的 `ListeningDomainNamesArray`，并支持 `ip domain` 形式 |
+| `--all` 会弄坏 Google | 官方规则里 `Google(Recaptcha) 验证码` 的匹配域名是 `google.com`、转发目标是 `www.recaptcha.net`，命中后 Google 首页返回 404 | 新增 `--exclude <项目名>` 选项按项目名排除规则，可重复指定 |
 
 ## 7. 已知限制
 
