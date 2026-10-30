@@ -43,6 +43,12 @@ const ushort hostsProxyPort = 443;
 const string defaultProxyDns = "223.5.5.5";
 const string defaultProxyIp = "127.0.0.1";
 
+/// <summary>规则配置文件名（位于数据目录）。</summary>
+const string RuleConfigFileName = "accelerate-rules.json";
+
+/// <summary>官方规则原始 JSON 的缓存文件名。</summary>
+const string OfficialRulesCacheFileName = "accelerate-projects.json";
+
 #if DEBUG
 var consoleTitle = $"[{Environment.ProcessId}, {IsProcessElevated_DEBUG_Only().ToLowerString()}] {Constants.CUSTOM_URL_SCHEME_NAME}({moduleName}) {string.Join(' ', args)}";
 SetConsoleTitle(consoleTitle);
@@ -109,6 +115,7 @@ var proxyIp = GetString(cli, "ip") ?? defaultProxyIp;
 var proxyDns = GetString(cli, "dns") ?? defaultProxyDns;
 var useDoh = !cli.ContainsKey("no-doh");
 var loadAllRules = cli.ContainsKey("all");
+var refreshRules = cli.ContainsKey("refresh-rules");
 
 // --exclude 可重复，按加速项目名排除规则（直接从原始参数扫描，避免被参数字典覆盖）
 var excludedRuleNames = new List<string>();
@@ -135,11 +142,15 @@ var sideEffectApplied = false;
 IOPath.InitFileSystem(GetAppDataDirectory, GetCacheDirectory);
 InitNLog();
 
+// 规则配置文件路径；--rules 可指定其它位置
+var ruleConfigPath = GetString(cli, "rules") ?? Path.Combine(IOPath.AppDataDirectory, RuleConfigFileName);
+
 Console.WriteLine($"{Constants.CUSTOM_URL_SCHEME_NAME} Accelerator");
 Console.WriteLine($"  mode      : {proxyMode} ({proxyModeText})");
 Console.WriteLine($"  listen    : {proxyIp}:{proxyPort}");
 Console.WriteLine($"  dns       : {proxyDns}{(useDoh ? " (DoH)" : string.Empty)}");
 Console.WriteLine($"  appdata   : {IOPath.AppDataDirectory}");
+Console.WriteLine($"  rules     : {ruleConfigPath}");
 Console.WriteLine();
 
 try
@@ -149,14 +160,18 @@ try
 
     var reverseProxyService = Ioc.Get<IReverseProxyService>();
 
-    var proxyDomains = await LoadAccelerateProjectsAsync(loadAllRules, excludedRuleNames);
+    var proxyDomains = await LoadAccelerateProjectsAsync(
+        ruleConfigPath,
+        loadAllRules,
+        excludedRuleNames,
+        refreshRules);
     if (proxyDomains.Count <= 0)
     {
-        Console.Error.WriteLine("未能获取任何加速规则（在线接口与本地缓存都不可用），代理将以「无规则直连」方式启动。");
+        Console.Error.WriteLine("没有启用任何加速规则，代理将以「无规则直连」方式启动。");
     }
     else
     {
-        Console.WriteLine($"已加载 {proxyDomains.Count} 条加速规则。");
+        Console.WriteLine($"已加载 {proxyDomains.Count} 条启用的加速规则。");
     }
 
     var settings = new ReverseProxySettings(
@@ -373,14 +388,65 @@ static void ConfigureServices(IServiceCollection services)
 }
 
 // ---------------------------------------------------------------------------
-// 加速规则：官方接口（匿名）+ 本地 JSON 缓存兜底
+// 加速规则：本地配置文件为唯一来源
+//
+// 首次运行（或 --refresh-rules）时从官方接口拉取规则并生成配置文件，
+// 之后每次启动都直接读配置文件，不再联网——想改规则就编辑那个 JSON。
 // ---------------------------------------------------------------------------
 
 static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsync(
+    string configPath,
     bool all,
-    IReadOnlyCollection<string> excludes)
+    IReadOnlyCollection<string> excludes,
+    bool refresh)
 {
-    var cacheFilePath = Path.Combine(IOPath.AppDataDirectory, "accelerate-projects.json");
+    // 1) 已有配置文件：直接使用（--refresh-rules 时才重新拉取官方规则）
+    var config = RuleConfig.Load(configPath, out var configError);
+    if (config != null && !refresh)
+    {
+        return SelectEnabled(config.ToProjects(), all, excludes);
+    }
+
+    // 配置文件存在但解析失败：不能覆盖用户的文件，直接报错退出
+    if (config == null && configError != null && !refresh)
+    {
+        throw new InvalidOperationException(
+            $"规则配置文件解析失败: {configError}\n请检查文件格式，或删除该文件让程序重新生成：{configPath}");
+    }
+
+    // 2) 没有配置文件或要求刷新：拉官方规则生成配置文件
+    var official = await FetchOfficialProjectsAsync();
+    if (official.Count <= 0)
+    {
+        if (config != null)
+        {
+            Log.Warn(tag, "拉取官方规则失败，继续使用现有配置文件。");
+            return SelectEnabled(config.ToProjects(), all, excludes);
+        }
+        return Array.Empty<AccelerateProjectDTO>();
+    }
+
+    // 刷新时保留用户改过的启用状态
+    var newConfig = RuleConfig.FromProjects(official, config);
+    try
+    {
+        newConfig.Save(configPath);
+        Console.WriteLine($"规则配置已写入: {configPath}");
+    }
+    catch (Exception ex)
+    {
+        Log.Error(tag, $"写入规则配置文件失败: {ex.Message}");
+    }
+
+    return SelectEnabled(newConfig.ToProjects(), all, excludes);
+}
+
+/// <summary>
+/// 从官方接口拉取全部规则（顶层项目）。
+/// </summary>
+static async Task<IReadOnlyList<AccelerateProjectDTO>> FetchOfficialProjectsAsync()
+{
+    var cacheFilePath = Path.Combine(IOPath.AppDataDirectory, OfficialRulesCacheFileName);
 
     try
     {
@@ -400,7 +466,7 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync();
-        var projects = ParseAccelerateProjects(json, all, excludes);
+        var projects = ParseOfficialProjects(json);
         if (projects.Count > 0)
         {
             await File.WriteAllTextAsync(cacheFilePath, json, Encoding.UTF8);
@@ -412,15 +478,16 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
         Log.Warn(tag, $"从官方接口获取加速规则失败: {ex.Message}");
     }
 
+    // 接口不可用时回落到上次抓取的原始 JSON
     try
     {
         if (File.Exists(cacheFilePath))
         {
             var json = await File.ReadAllTextAsync(cacheFilePath);
-            var projects = ParseAccelerateProjects(json, all, excludes);
+            var projects = ParseOfficialProjects(json);
             if (projects.Count > 0)
             {
-                Console.WriteLine("已使用本地缓存的加速规则。");
+                Console.WriteLine("官方接口不可用，使用本地缓存的原始规则。");
                 return projects;
             }
         }
@@ -433,10 +500,10 @@ static async Task<IReadOnlyList<AccelerateProjectDTO>> LoadAccelerateProjectsAsy
     return Array.Empty<AccelerateProjectDTO>();
 }
 
-static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(
-    string json,
-    bool all,
-    IReadOnlyCollection<string> excludes)
+/// <summary>
+/// 解析官方接口返回的原始 JSON，取出全部顶层项目。
+/// </summary>
+static IReadOnlyList<AccelerateProjectDTO> ParseOfficialProjects(string json)
 {
     var rsp = JsonSerializer.Deserialize<ApiRsp<List<AccelerateProjectGroupDTO>>>(json);
     var groups = rsp?.Content;
@@ -445,32 +512,33 @@ static IReadOnlyList<AccelerateProjectDTO> ParseAccelerateProjects(
         return Array.Empty<AccelerateProjectDTO>();
     }
 
-    var projects = groups
+    return groups
         .SelectMany(x => x.Items ?? new List<AccelerateProjectDTO>())
         .ToArray();
+}
 
-    if (all)
+/// <summary>
+/// 按配置文件里的开关与命令行覆盖项筛选启用的规则。
+/// </summary>
+static IReadOnlyList<AccelerateProjectDTO> SelectEnabled(
+    IReadOnlyList<AccelerateProjectDTO> projects,
+    bool all,
+    IReadOnlyCollection<string> excludes)
+{
+    IEnumerable<AccelerateProjectDTO> result = projects;
+
+    if (!all)
     {
-        projects = projects.ToArray();
-    }
-    else
-    {
-        // 默认只启用服务端标记为已勾选的项目；若接口没有回传勾选状态则全部启用
-        var checkedProjects = projects.Where(x => x.Checked).ToArray();
-        projects = checkedProjects.Length > 0 ? checkedProjects : projects;
+        result = result.Where(x => x.Checked);
     }
 
-    if (excludes.Count <= 0)
+    if (excludes.Count > 0)
     {
-        return projects;
+        result = result.Where(x => !excludes.Any(e =>
+            string.Equals(e, x.Name, StringComparison.OrdinalIgnoreCase)));
     }
 
-    // --exclude 按项目名排除（不区分大小写）。用于剔除规则集中会把常用域名劫持到
-    // 非预期目标的项，例如「Google(Recaptcha) 验证码」会把 google.com 转发到 recaptcha.net。
-    return projects
-        .Where(x => !excludes.Any(e =>
-            string.Equals(e, x.Name, StringComparison.OrdinalIgnoreCase)))
-        .ToArray();
+    return result.ToArray();
 }
 
 // ---------------------------------------------------------------------------
@@ -518,8 +586,10 @@ static void PrintUsage()
     Console.WriteLine("  --ip <地址>                              监听地址，默认 127.0.0.1");
     Console.WriteLine("  --dns <地址>                             上游 DNS，默认 223.5.5.5");
     Console.WriteLine("  --no-doh                                 关闭 DoH");
-    Console.WriteLine("  --all                                    启用官方规则里的全部项目（默认仅启用服务端已勾选项）");
+    Console.WriteLine("  --all                                    忽略配置文件里的开关，启用全部规则");
     Console.WriteLine("  --exclude <项目名>[,<项目名>...]        按项目名排除规则，可重复指定");
+    Console.WriteLine("  --rules <路径>                          指定规则配置文件，默认 <数据目录>\\accelerate-rules.json");
+    Console.WriteLine("  --refresh-rules                         从官方接口重新拉取规则并更新配置文件（保留已改动的开关）");
     Console.WriteLine("  --help                                   显示帮助");
 }
 

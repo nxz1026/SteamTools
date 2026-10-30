@@ -76,8 +76,10 @@ Steam++.Accelerator.exe [选项]
   --ip <地址>                              监听地址，默认 127.0.0.1
   --dns <地址>                             上游 DNS，默认 223.5.5.5
   --no-doh                                 关闭 DoH
-  --all                                    启用官方规则里的全部项目（默认仅启用服务端已勾选项）
+  --all                                    忽略配置文件里的开关，启用全部规则
   --exclude <项目名>[,<项目名>...]        按项目名排除规则，可重复指定
+  --rules <路径>                          指定规则配置文件，默认 <数据目录>\accelerate-rules.json
+  --refresh-rules                         从官方接口重新拉取规则并更新配置文件（保留已改动的开关）
   --help                                   显示帮助
 ```
 
@@ -112,28 +114,43 @@ Content-Type: application/json
 {}
 ```
 
-成功后原始 JSON 会缓存到数据目录下的 `accelerate-projects.json`，接口不可用时用该缓存兜底。
+### 规则配置文件
 
-接口共返回 58 个加速项目，服务端标记 `Checked=true` 的只有 5 个，且**全部是 Steam 相关**——
-GitHub 的 12 条规则默认都是 `Checked=false`。所以：
+**规则由一个 JSON 文件控制，随时可以改，改完重启程序即可生效。**
 
-- 只加速 Steam → 不加 `--all`
-- 还要加速 GitHub → 加 `--all`
+| 项 | 路径 |
+|---|---|
+| 规则配置 | `%LOCALAPPDATA%\Steam++Accelerator\accelerate-rules.json` |
 
-`--all` 会带上一条有害规则，需要用 `--exclude` 排除：
+程序启动时**只读这个文件，不联网**。首次运行（或用 `--refresh-rules`）时从官方接口拉一次规则并生成该文件，
+之后完全以文件为准。
 
-| 项目名 | 匹配域名 | 转发目标 | 后果 |
-|---|---|---|---|
-| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | Google 首页变成 404 |
+每条规则的结构：
 
-```bash
-Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
+```json
+{
+  "name": "Steam 商店",
+  "enabled": true,
+  "matchDomainNames": "store.steampowered.com;api.steampowered.com;...",
+  "forwardDomainNames": "steamstore.rmbgame.net",
+  "listenDomainNames": "store.steampowered.com;...",
+  "port": 443,
+  "proxyType": 0
+}
 ```
 
-`--exclude` 按**项目名**匹配（不区分大小写），可重复指定，也可用逗号分隔多个。
+改 `enabled` 就能控制规则开关，其它字段一般不用动。文件支持 `//` 注释。
 
-> 注意：规则的匹配字段是 `MatchDomainNames`，按 `^` 锚定的正则匹配，因此
-> `raw.githubusercontent.com` 这类域名不在规则的匹配范围内，走直连，不受影响。
+**默认启用 Steam + GitHub**（共 17 条）。想启用别的规则（Twitch、Docker Hub、Google Fonts 等），
+把对应条目的 `enabled` 改成 `true` 即可。
+
+拉取官方最新规则（会保留你改过的 `enabled` 状态）：
+
+```bash
+Steam++.Accelerator.exe --mode dns --refresh-rules
+```
+
+> 配置文件解析失败时程序会报错退出并保留原文件，不会静默覆盖你的改动。
 
 ### 关于 Google
 
@@ -141,7 +158,7 @@ Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
 
 | 项目名 | 匹配域名 | 转发目标 | 效果 |
 |---|---|---|---|
-| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | ❌ Google 首页变成 404，**必须排除** |
+| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | ❌ Google 首页变成 404，**别启用** |
 | `ajax.googleapis.com` | `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | ✅ 走中国镜像 |
 | `fonts.googleapis.com` | `fonts.googleapis.com` | `fonts.font.im` | ✅ 走中国镜像 |
 | `fonts.gstatic.com` | `fonts.gstatic.com` | `gstatic.loli.net` | ✅ 走中国镜像 |
@@ -149,16 +166,19 @@ Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
 
 **`google.com` / `www.google.com` 本身无法加速**——规则集里唯一匹配它的那条是验证码规则，
 用途是让页面里的 reCAPTCHA 组件能加载，而不是把 Google 搜索结果代理出来。
-排除这条规则后 `google.com` 走直连（是否可达取决于你本机网络）。
+在配置文件里把它的 `enabled` 设为 `false` 即可。
 
-实测（`--all --exclude "Google(Recaptcha) 验证码"`）：
+实测（启用上述 API / 字体类规则）：
 
 | 域名 | 转发到 | 结果 |
 |---|---|---|
 | `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | 200 |
 | `fonts.googleapis.com` | `fonts.font.im` | 200 |
 | `fonts.gstatic.com` | `gstatic.loli.net` | 200 |
-| `google.com` | （直连，不劫持） | 走本机网络 |
+| `google.com` | （不启用该规则则不劫持） | 走本机网络 |
+
+> 注意：规则的匹配字段是 `matchDomainNames`，按 `^` 锚定的正则匹配，因此
+> `raw.githubusercontent.com` 这类域名不在规则的匹配范围内，走直连，不受影响。
 
 ## 数据目录与日志
 
@@ -169,10 +189,19 @@ Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
 
 日志写在 `<数据目录>/Cache/Logs/accelerator-<日期>.log`（单文件 10 MB 轮转，保留 14 份）。
 
+数据目录内容：
+
+| 文件 | 说明 |
+|---|---|
+| `accelerate-rules.json` | **规则配置**，改这个文件控制启用哪些规则 |
+| `accelerate-projects.json` | 官方规则原始 JSON 缓存（`--refresh-rules` 时的兜底） |
+| `Cache/Logs/` | 运行日志 |
+
 ## 目录结构
 
 ```
 src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/   代理引擎 + 独立宿主（Program.cs）
+src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/RuleConfig.cs  规则配置文件读写
 src/OSShuttingDownHelper/                              系统关机检测（共享项目）
 src/*.props                                            目标框架与集中包版本
 ref/Common/                                            上游基础库（子模块）

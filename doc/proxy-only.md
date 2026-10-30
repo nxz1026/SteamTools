@@ -96,6 +96,8 @@
 
 ## 4. 加速规则
 
+规则集来自官方接口，**匿名即可获取**：
+
 ```
 POST https://api.steampp.net/accelerator/projectgroups
 Content-Type: application/json
@@ -106,23 +108,69 @@ Content-Type: application/json
 - 匿名可用（未登录时只是不带 `Authorization` 头），实测返回 HTTP 200、约 28 KB；
 - 响应是 emoji 键的包装结构：`{"🦓": [...], "🦄": 200, "🐴": null}`，对应 `ApiRsp<T>.Content / Code / Message`，
   正文为 PascalCase，`System.Text.Json` 默认配置即可反序列化；
-- 按组拍平后取 `Checked == true` 的项目，默认约 58 个项目中只有 5 个被标记启用，加 `--all` 可全部启用；
-- **这 5 个默认项全部是 Steam 相关**，GitHub 的 12 条规则服务端标记的都是 `Checked == false`。
-  要加速 GitHub 必须加 `--all`；
-- `--all` 会带上一条有害规则：`Google(Recaptcha) 验证码` 的 `MatchDomainNames` 是 `google.com`、
-  `ForwardDomainNames` 是 `www.recaptcha.net`，命中后 Google 首页会变成 404。
-  新增 `--exclude <项目名>` 选项按项目名排除规则（不区分大小写，可重复指定），默认用法：
-  ```
-  Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
-  ```
-- 原始 JSON 缓存在 `<数据目录>/accelerate-projects.json`，接口不可用时用缓存兜底。
-- 规则的匹配字段是 `MatchDomainNames`，`DomainPattern` 用 `^` 锚定的正则匹配，
-  因此 `raw.githubusercontent.com` 这类域名不在匹配范围内，走直连。
-- **Google 只能加速 API / 字体类域名**（`ajax.googleapis.com` → `ajax.proxy.ustclug.org`、
-  `fonts.googleapis.com` → `fonts.font.im`、`fonts.gstatic.com` → `gstatic.loli.net`、
-  `themes.googleusercontent.com` → `themes.loli.net`，实测均 200）；
-  `google.com` / `www.google.com` 本身无法加速——规则集里唯一匹配它的是验证码规则，
-  转发到 `www.recaptcha.net`，命中后首页返回 404（`Server: ESF`），必须排除。
+- 拍平后共 58 个顶层项目（含子项 62 个节点）。
+
+### 规则配置文件
+
+规则集落成**一个可手工编辑的 JSON 文件**，程序启动时只读文件、不联网：
+
+| 项 | 值 |
+|---|---|
+| 路径 | `<数据目录>/accelerate-rules.json`（`--rules` 可指定其它位置） |
+| 结构 | `RuleConfig` / `RuleConfig.RuleEntry`（见 `src/.../RuleConfig.cs`） |
+| 序列化 | camelCase、缩进、UTF-8 无 BOM，文件头带 `//` 编辑说明 |
+| 反序列化 | `ReadCommentHandling = Skip`，允许用户写 `//` 注释与尾随逗号 |
+
+每条规则的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `name` | 规则名称，也是与官方规则集比对的键 |
+| `enabled` | 是否启用 |
+| `matchDomainNames` | 命中域名（分号分隔） |
+| `forwardDomainNames` | 转发目标（国内加速节点） |
+| `listenDomainNames` | hosts 模式写入 hosts 的域名 |
+| `port` | 目标端口 |
+| `proxyType` | 0=本地代理 1=重定向 2=直连成功 3=服务端代理 |
+| `ignoreSslCertVerification` / `fakeServerName` / `fakeUserAgent` | 证书与 UA 相关 |
+| `items` | 子规则，用于更细的路径匹配 |
+
+**默认启用 Steam + GitHub**（共 17 条）——判断依据是规则名以 `Steam` / `Github` 开头
+（`RuleConfig.IsEnabledByDefault`）。其它规则默认关闭，想开就改 `enabled`。
+
+### 命令行
+
+| 选项 | 作用 |
+|---|---|
+| `--rules <路径>` | 指定规则配置文件位置 |
+| `--refresh-rules` | 从官方接口重新拉取并更新配置文件，**已改动的 `enabled` 按名字保留** |
+| `--all` | 忽略配置文件里的开关，启用全部规则 |
+| `--exclude <项目名>[,<项目名>...]` | 按项目名排除规则，可重复指定 |
+
+配置文件**解析失败时程序报错退出并保留原文件**，不会静默覆盖用户的改动。
+
+### 已知的有害规则
+
+| 项目名 | 匹配域名 | 转发目标 | 后果 |
+|---|---|---|---|
+| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | Google 首页 404（`Server: ESF`），**别启用** |
+
+其余 Google 相关项是 API / 字体类，转发到国内镜像后实测均 200：
+
+| 域名 | 转发到 |
+|---|---|
+| `ajax.googleapis.com` | `ajax.proxy.ustclug.org` |
+| `fonts.googleapis.com` | `fonts.font.im` |
+| `fonts.gstatic.com` | `gstatic.loli.net` |
+| `themes.googleusercontent.com` | `themes.loli.net` |
+
+**`google.com` / `www.google.com` 本身无法加速**——规则集里唯一匹配它的是验证码规则，
+用途是让页面内嵌的 reCAPTCHA 组件能加载，不是代理 Google 搜索。
+
+规则的匹配字段是 `matchDomainNames`，`DomainPattern` 用 `^` 锚定的正则匹配，
+因此 `raw.githubusercontent.com` 这类域名不在匹配范围内，走直连。
+
+原始 JSON 缓存在 `<数据目录>/accelerate-projects.json`，接口不可用时用缓存兜底。
 
 ## 5. 跨平台条件编译
 
