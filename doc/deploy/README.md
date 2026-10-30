@@ -66,52 +66,47 @@ powershell ... "Start-Process -FilePath '%EXE%' -ArgumentList '--mode','%MODE%',
 而 `Start-Process` 拉起的进程会附着调用方 ConPTY，**调用方 shell 一退，控制台关闭，
 exe 跟着被带走**，很容易误判成程序崩溃。这一项只能人工确认。
 
-## 桌面快捷方式
+## 桌面启动器（用 .bat，不要用 .lnk）
 
-快捷方式指向 `launch.bat`（不是 exe）。指向 exe 会绕过提权逻辑，`dns` / `system` 模式因缺少
-管理员权限直接失败；指向 bat 则由脚本自己申请提权。
+双击启动用 **`.bat`** 而不是 `.lnk`。本机 `WScript.Shell` COM 与 `Add-Type` 都被安全策略拦截，
+手写 MS-SHLLINK 二进制虽然能写出，但 Explorer 经常解析不了，**双击毫无反应**（已踩坑：
+之前放到桌面的手写 `.lnk` 双击完全不启动）。`.bat` 双击必执行，不依赖 COM、不依赖二进制格式，最可靠。
 
-| 属性 | 值 |
-|---|---|
-| 目标 | `<部署目录>\launch.bat` |
-| 参数 | `system`（已验证模式）/ `dns`（覆盖更彻底，未经发布版验证）/ `console system` |
-| 起始位置 | `<部署目录>` |
-| 图标 | `<部署目录>\Steam++.Accelerator.exe`,0 |
+桌面 `Steam++ 加速.bat` 内容（**纯 ASCII**，见下方注意事项）：
 
-参数留空等于 `dns` 模式（`launch.bat` 的默认值），需要管理员 + WinDivert 驱动。
-
-### 本机无法用常规方式创建
-
-`WScript.Shell` COM 与 `Add-Type` 都被安全策略拦截：
-
+```bat
+@echo off
+REM Steam++ Accelerator launcher (system mode)
+REM Double-click to run; no UAC needed (root cert already installed).
+REM Black window auto-hides; tray icon appears at bottom-right.
+REM To stop: right-click tray icon -> Exit.
+REM For dns mode (deeper coverage, needs admin): change --mode system to --mode dns
+set "EXE=C:\SteamToolsAccelerator\Steam++.Accelerator.exe"
+if not exist "%EXE%" (
+    echo Cannot find %EXE%
+    pause
+    exit /b 1
+)
+start "" "%EXE%" --mode system
+exit /b 0
 ```
-Command blocked for security: COM object instantiation can run arbitrary code (e.g. WScript.Shell)
-Command blocked for security: Add-Type compiles and loads .NET code at runtime
-```
 
-可行路径是**直接按 MS-SHLLINK 写二进制**。关键字段：
+### 关键注意：.bat 必须纯 ASCII
 
-| 字段 | 值 |
-|---|---|
-| HeaderSize | `0x4C`（76 字节） |
-| LinkCLSID | `00021401-0000-0000-C000-000000000046` |
-| LinkFlags | `0x02` HasLinkInfo + `0x10` HasWorkingDir + `0x20` HasArguments + `0x40` HasIconLocation |
-| FileAttributes | `0x20` ARCHIVE |
-| ShowCommand | `1` |
-| LinkInfoHeaderSize | `0x1C`，LinkInfoFlags `0x01`（VolumeIDAndLocalBasePath） |
-| StringData 顺序 | `WORKING_DIR` → `COMMAND_LINE_ARGUMENTS` → `ICON_LOCATION`（顺序由规范固定，不可调换） |
+本机 cmd 的活动代码页是 GBK（936）。`.bat` 若是 UTF-8 无 BOM 且含中文，cmd 按 GBK 读取会
+变成乱码，乱码字节可能破坏 `start` 那一行的解析，报
+`'--mode' 不是内部或外部命令`，甚至把 `--mode` 当成独立命令执行。
+**所有注释用纯英文**，或保存为 GBK / UTF-8 with BOM。这里统一纯 ASCII 最省心。
 
-两个容易写错的地方：
+### 为什么直接 `start` exe，不走 `launch.bat`
 
-- **LinkInfo 内所有 offset 都相对 LinkInfo 起点**，不是文件起点。读回校验时若忘了
-  加上头部长度 76，路径会读成乱码。
-- 不设置 `HasLinkTargetIDList`（`0x01`）时只靠 LinkInfo 提供目标，这是合法的
-  **最小形式**，但意味着没有 IDList 可供 shell 做项标识；如需固定图标分组或跳转列表
-  才必须补 IDList。
+`launch.bat` 的提权分支依赖 `net session` 检测 + `Start-Process -Verb RunAs`，双击会弹 UAC。
+但 system 模式的核心（写 HKCU 代理 + 监听 26501）**不需要管理员**——根证书 `SteamTools Certificate`
+已装入 `LocalMachine\Root`，所以桌面启动器直接 `start "" "%EXE%" --mode system`，
+双击即跑、无 UAC。需要 dns 模式（WinDivert，需提权）时再改用 `launch.bat` 或显式 `--mode dns`。
 
-生成后校验方式（不需要 COM）：按规范从字节流回读 `LinkInfo` 的
-`LocalBasePathOffset` / `CommonPathSuffixOffset`，比对路径字符串与
-`CommonPathSuffix` 是否为空串，并确认解析 StringData 后**剩余字节为 0**。
+实测（双击等效：在 cmd 中执行该 .bat）：进程存活、`ProxyEnable=1`、`ProxyServer=127.0.0.1:26501`、
+26501 端口监听均成立。
 
 ## 相关文档
 
