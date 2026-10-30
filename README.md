@@ -1,7 +1,7 @@
 # Steam++ Accelerator · 仅代理版
 
-> 本仓库是 [Watt Toolkit（原 Steam++ / SteamTools）](https://github.com/BeyondDimension/SteamTools) 的**裁剪分支（fork）**，
-> 只保留其中的「网络加速 / 反向代理」能力，删除了全部界面与 Steam 账号、令牌、游戏库等业务功能。
+> [Watt Toolkit（原 Steam++ / SteamTools）](https://github.com/BeyondDimension/SteamTools) 的**裁剪分支（fork）**：
+> 只保留「网络加速 / 反向代理」能力，删除全部界面与 Steam 账号、令牌、游戏库等业务功能。
 > 上游以 **GPL-3.0** 授权，本仓沿用同一许可，详见 [LICENSE](LICENSE)。
 
 | 项 | 值 |
@@ -15,41 +15,21 @@
 
 一个**没有界面、可以独立运行**的 Windows 控制台程序 `Steam++.Accelerator.exe`：
 
-- 在本机启动一个 HTTP 代理端口（默认 `127.0.0.1:26501`）；
-- 内置 YARP 反向代理与自签 CA（MITM 解密），按官方加速规则把命中域名的流量转发到加速节点；
-- 可选地把系统流量引流过来：Windows 系统代理 / PAC / hosts / WinDivert 驱动级 DNS 拦截。
+- 内置 YARP 反向代理与自签 CA（MITM 解密），按加速规则把命中域名的流量转发到国内加速节点；
+- 可选地把系统流量引流过来：Windows 系统代理 / PAC / hosts / WinDivert 驱动级 DNS 拦截；
+- 加速规则由一个 JSON 配置文件控制，随时可改。
 
-> `system` / `pac` / `proxyonly` 三种模式监听 `--port` 指定的正向代理端口；
-> `hosts` / `dns` 两种模式由引擎在 `443` / `80` 上做反向代理（配合 hosts 改写或 DNS 拦截引流）。
+与上游最大的结构差异：它**不再作为 GUI 主程序的 IPC 子进程**运行——没有命名管道、没有父进程签名校验、
+不需要 `modules/Accelerator/` 目录布局，可以直接运行、写进计划任务或做成服务。
 
-与上游客户端最大的结构差异：它**不再作为 GUI 主程序的 IPC 子进程**运行。
-没有命名管道、没有父进程签名校验、不需要 `modules/Accelerator/` 目录布局，可以直接运行、写进计划任务或做成服务。
-
-它**不是**：Steam 账号管理工具、令牌验证器、游戏库挂卡工具、ArchiSteamFarm 管理器——这些都在裁剪中删除。
-
-## 与上游的差异
-
-保留：
-
-- `src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/` —— 代理引擎本体（YARP 反代、MITM 证书、HTTP/HTTPS/SSH/Git 中间件、DNS 分析与 DoH、流量统计、WinDivert 数据包拦截）。
-
-删除：
-
-- 全部 Avalonia 界面工程与 `src/BD.WTTS.Client.Avalonia.App`（主程序 `Steam++`）；
-- `src/BD.WTTS.Client`（约 3.8 万行的客户端基础库）与全部业务插件（账号、令牌、游戏列表、挂卡、ASF、工具箱、更新器）；
-- `src/BD.WTTS.Client.IPC` 与 `ref/dotnetCampus.Ipc`：改为在引擎项目内提供同名的 `IPCPlatformService` / `IPCToastService` 本地实现；
-- 上游的 17 个子模块只保留 3 个（`ref/DirectoryPackages`、`ref/Common`、`ref/WTTS.MicroServices.ClientSDK`）；
-- Windows AppCenter 遥测（`VisualStudioAppCenterSDK`）、迅游 SDK（`XunYouSDK`）、MSIX/发布工具链、macOS/Linux 打包脚本、多语言与站点相关文件。
-
-改造：
-
-- `Program.cs` 重写为独立宿主（命令行解析 → 初始化数据目录与日志 → `Ioc` 容器 → 拉取加速规则 → 组装 `ReverseProxySettings` → `StartProxyAsync` → 施加系统副作用 → 等待退出信号 → 反向清理）；
-- 系统副作用（系统代理 / PAC / hosts）原在被删除的 `ProxyService.Operate.cs` 里，现在直接实现在 `Program.cs` 中；
-- 加速规则改用官方接口匿名拉取（见下），离线时回落到本地 JSON 缓存。
+裁剪掉的：全部 Avalonia 界面工程、`src/BD.WTTS.Client`（约 3.8 万行基础库）与全部业务插件、
+`src/BD.WTTS.Client.IPC` 与 `ref/dotnetCampus.Ipc`（改为引擎内的同名本地实现）、
+17 个子模块中的 14 个、AppCenter 遥测、迅游 SDK、MSIX/发布工具链与多语言站点文件。
+详见 [doc/proxy-only.md](doc/proxy-only.md)。
 
 ## 构建
 
-需要 **.NET 11 预览 SDK**（见 `global.json`，`rollForward: latestMajor`、`allowPrerelease: true`）。
+需要 **.NET 11 预览 SDK**（见 `global.json`）。
 
 ```bash
 git clone --recurse-submodules https://github.com/nxz1026/SteamTools.git
@@ -60,8 +40,7 @@ dotnet publish src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/BD.WTTS.Clien
   -c Release -f net11.0 -r win-x64 --self-contained true -o dist/win-x64
 ```
 
-框架依赖的构建把 `--self-contained true` 换成 `false` 即可；
-只在本机调试时可以直接 `dotnet build WattToolkit.slnx -c Debug`。
+框架依赖的构建把 `--self-contained true` 换成 `false` 即可。
 
 > 子模块必须是完整的：`ref/WTTS.MicroServices.ClientSDK` 自身还有两个嵌套子模块，
 > 所以要用 `--recurse-submodules`（或事后执行 `git submodule update --init --recursive`）。
@@ -72,7 +51,7 @@ dotnet publish src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/BD.WTTS.Clien
 Steam++.Accelerator.exe [选项]
 
   --mode <system|hosts|pac|dns|proxyonly>  运行模式，默认 system
-  --port <端口>                            代理监听端口，默认 26501（hosts 模式 443）
+  --port <端口>                            代理监听端口，默认 26501（hosts / dns 模式固定 443）
   --ip <地址>                              监听地址，默认 127.0.0.1
   --dns <地址>                             上游 DNS，默认 223.5.5.5
   --no-doh                                 关闭 DoH
@@ -96,36 +75,25 @@ Steam++.Accelerator.exe [选项]
 几点注意：
 
 - `--ip` 默认只监听 `127.0.0.1`。改成 `0.0.0.0` 会把这个 MITM 代理暴露给同网段的所有设备，请谨慎。
-- `hosts` 模式在 `C:\Windows\System32\drivers\etc\hosts` 的 `# --- Steam++Accelerator BEGIN/END ---`
-  标记块内写入域名，退出时整块删除并还原文件原样（按字节保真，不会改动文件其它内容）。
-- `hosts` / `dns` 模式由引擎在 `443` / `80` 上做反向代理，`--port` 对这两种模式无效（仅 `system` / `pac` / `proxyonly` 使用）。
+- `hosts` / `dns` 模式由引擎在 `443` / `80` 上做反向代理，`--port` 对这两种模式无效。
 - 首次运行会生成一张自签根证书并写入受信任的根证书存储：优先写 `LocalMachine\Root`（需管理员），
-  无管理员权限时回退到 `CurrentUser\Root`（仅对本用户生效，浏览器与 .NET 客户端同样信任）。
+  无管理员权限时回退到 `CurrentUser\Root`（仅对本用户生效）。
 - `dns` 模式依赖 `WinDivert.dll` / `WinDivert64.sys`，发布目录中已随程序附带；加载驱动需要管理员权限。
-- 程序退出时若被强杀（而非 `Ctrl+C`），`system` / `pac` 写下的注册表项不会被撤销，需要手动关闭系统代理。
+- 强杀进程（而非 `Ctrl+C`）不会撤销系统代理设置，需要手动关闭。
 
-## 加速规则从哪来
+## 加速规则
 
-规则（域名 → 加速节点）来自官方接口，**匿名即可获取，不需要登录账号**：
-
-```
-POST https://api.steampp.net/accelerator/projectgroups
-Content-Type: application/json
-{}
-```
-
-### 规则配置文件
-
-**规则由一个 JSON 文件控制，随时可以改，改完重启程序即可生效。**
+规则（域名 → 加速节点）由**一个 JSON 配置文件**控制，随时可以改，改完重启程序即生效：
 
 | 项 | 路径 |
 |---|---|
 | 规则配置 | `%LOCALAPPDATA%\Steam++Accelerator\accelerate-rules.json` |
 
-程序启动时**只读这个文件，不联网**。首次运行（或用 `--refresh-rules`）时从官方接口拉一次规则并生成该文件，
-之后完全以文件为准。
+程序启动时**只读这个文件，不联网**。首次运行（或用 `--refresh-rules`）时从官方接口
+`POST https://api.steampp.net/accelerator/projectgroups`（匿名可用）拉一次规则并生成该文件，
+之后完全以文件为准。`--refresh-rules` 会重新拉取并**保留你改过的 `enabled` 状态**。
 
-每条规则的结构：
+每条规则带一个 `enabled` 开关，规则下面附有一行中文注释说明它的作用：
 
 ```json
 {
@@ -133,52 +101,32 @@ Content-Type: application/json
   "enabled": true,
   "matchDomainNames": "store.steampowered.com;api.steampowered.com;...",
   "forwardDomainNames": "steamstore.rmbgame.net",
-  "listenDomainNames": "store.steampowered.com;...",
   "port": 443,
   "proxyType": 0
-}
+},
+// 本地代理：store.steampowered.com 等 5 个域名 直连 steamstore.rmbgame.net 取数据，保留原始 Host
 ```
-
-改 `enabled` 就能控制规则开关，其它字段一般不用动。文件支持 `//` 注释。
 
 **默认启用 Steam + GitHub**（共 17 条）。想启用别的规则（Twitch、Docker Hub、Google Fonts 等），
-把对应条目的 `enabled` 改成 `true` 即可。
+把对应条目的 `enabled` 改成 `true` 即可。文件支持 `//` 注释；
+解析失败时程序会报错退出并保留原文件，不会静默覆盖你的改动。
 
-拉取官方最新规则（会保留你改过的 `enabled` 状态）：
+### Google
 
-```bash
-Steam++.Accelerator.exe --mode dns --refresh-rules
-```
+`google.com` / `www.google.com` **本身无法加速**——规则集里唯一匹配它的是 `Google(Recaptcha) 验证码`，
+转发到 `www.recaptcha.net`，用途是让页面里的 reCAPTCHA 组件能加载，启用它只会让 Google 首页变成 404。
 
-> 配置文件解析失败时程序会报错退出并保留原文件，不会静默覆盖你的改动。
+能加速的是 Google 的 API / 字体类域名，实测均 200：
 
-### 关于 Google
+| 域名 | 转发到（国内镜像） |
+|---|---|
+| `ajax.googleapis.com` | `ajax.proxy.ustclug.org` |
+| `fonts.googleapis.com` | `fonts.font.im` |
+| `fonts.gstatic.com` | `gstatic.loli.net` |
+| `themes.googleusercontent.com` | `themes.loli.net` |
 
-规则集里 Google 相关的项分两类，**只有 API / 字体类能真正加速**：
-
-| 项目名 | 匹配域名 | 转发目标 | 效果 |
-|---|---|---|---|
-| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | ❌ Google 首页变成 404，**别启用** |
-| `ajax.googleapis.com` | `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | ✅ 走中国镜像 |
-| `fonts.googleapis.com` | `fonts.googleapis.com` | `fonts.font.im` | ✅ 走中国镜像 |
-| `fonts.gstatic.com` | `fonts.gstatic.com` | `gstatic.loli.net` | ✅ 走中国镜像 |
-| `themes.googleusercontent.com` | `themes.googleusercontent.com` | `themes.loli.net` | ✅ 走中国镜像 |
-
-**`google.com` / `www.google.com` 本身无法加速**——规则集里唯一匹配它的那条是验证码规则，
-用途是让页面里的 reCAPTCHA 组件能加载，而不是把 Google 搜索结果代理出来。
-在配置文件里把它的 `enabled` 设为 `false` 即可。
-
-实测（启用上述 API / 字体类规则）：
-
-| 域名 | 转发到 | 结果 |
-|---|---|---|
-| `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | 200 |
-| `fonts.googleapis.com` | `fonts.font.im` | 200 |
-| `fonts.gstatic.com` | `gstatic.loli.net` | 200 |
-| `google.com` | （不启用该规则则不劫持） | 走本机网络 |
-
-> 注意：规则的匹配字段是 `matchDomainNames`，按 `^` 锚定的正则匹配，因此
-> `raw.githubusercontent.com` 这类域名不在规则的匹配范围内，走直连，不受影响。
+> 规则的匹配字段是 `matchDomainNames`，按 `^` 锚定的正则匹配，因此 `raw.githubusercontent.com`
+> 这类域名不在规则的匹配范围内，走直连，不受影响。
 
 ## 数据目录与日志
 
@@ -187,15 +135,11 @@ Steam++.Accelerator.exe --mode dns --refresh-rules
 | Windows | `%LOCALAPPDATA%\Steam++Accelerator` |
 | 其它 | `~/.config/Steam++Accelerator` |
 
-日志写在 `<数据目录>/Cache/Logs/accelerator-<日期>.log`（单文件 10 MB 轮转，保留 14 份）。
-
-数据目录内容：
-
 | 文件 | 说明 |
 |---|---|
 | `accelerate-rules.json` | **规则配置**，改这个文件控制启用哪些规则 |
 | `accelerate-projects.json` | 官方规则原始 JSON 缓存（`--refresh-rules` 时的兜底） |
-| `Cache/Logs/` | 运行日志 |
+| `Cache/Logs/accelerator-<日期>.log` | 运行日志（10 MB 轮转，保留 14 份） |
 
 ## 目录结构
 

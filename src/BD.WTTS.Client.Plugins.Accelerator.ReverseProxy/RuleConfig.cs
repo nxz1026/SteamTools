@@ -195,7 +195,7 @@ public sealed class RuleConfig
     }
 
     /// <summary>
-    /// 写出配置文件（UTF-8，缩进便于手工编辑）。
+    /// 写出配置文件（UTF-8，缩进便于手工编辑，每条规则后附一行中文说明）。
     /// </summary>
     public void Save(string path)
     {
@@ -205,13 +205,6 @@ public sealed class RuleConfig
             Directory.CreateDirectory(directory);
         }
 
-        var json = JsonSerializer.Serialize(this, new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        });
-
         var header =
             "// Steam++ Accelerator 加速规则配置\n" +
             "// 直接改这个文件即可控制启用的规则，改完重启程序生效。\n" +
@@ -219,10 +212,122 @@ public sealed class RuleConfig
             "//   matchDomainNames     命中域名（分号分隔）\n" +
             "//   forwardDomainNames   转发目标（国内加速节点）\n" +
             "//   listenDomainNames    hosts 模式写入的域名\n" +
+            "// 每条规则下面都有一行 // 注释，说明这条规则的作用。\n" +
             "// 用 --refresh-rules 可从官方接口拉取最新规则，已改动的 enabled 状态按名字保留。\n";
 
-        File.WriteAllText(path, header + json + "\n", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        File.WriteAllText(path, header + WriteJson() + "\n", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
+
+    /// <summary>
+    /// 手工拼装 JSON：标准序列化器不支持注释，这里逐条写出并在规则后插入说明。
+    /// </summary>
+    string WriteJson()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\n");
+        sb.Append($"  \"version\": {Version},\n");
+        sb.Append($"  \"generatedAt\": {Quote(GeneratedAt.ToString("O"))},\n");
+        sb.Append($"  \"source\": {Quote(Source)},\n");
+        sb.Append("  \"rules\": [\n");
+        for (var i = 0; i < Rules.Count; i++)
+        {
+            WriteRule(sb, Rules[i], 4);
+            if (i < Rules.Count - 1)
+            {
+                sb.Append(',');
+            }
+            sb.Append('\n');
+            sb.Append("    // ").Append(Describe(Rules[i])).Append('\n');
+        }
+        sb.Append("  ]\n");
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    static void WriteRule(StringBuilder sb, RuleEntry rule, int indent)
+    {
+        var pad = new string(' ', indent);
+        sb.Append(pad).Append("{\n");
+        sb.Append(pad).Append("  \"name\": ").Append(Quote(rule.Name)).Append(",\n");
+        sb.Append(pad).Append("  \"enabled\": ").Append(rule.Enabled ? "true" : "false").Append(",\n");
+        sb.Append(pad).Append("  \"matchDomainNames\": ").Append(Quote(rule.MatchDomainNames)).Append(",\n");
+        sb.Append(pad).Append("  \"forwardDomainNames\": ").Append(Quote(rule.ForwardDomainNames)).Append(",\n");
+        sb.Append(pad).Append("  \"listenDomainNames\": ").Append(Quote(rule.ListenDomainNames)).Append(",\n");
+        sb.Append(pad).Append("  \"port\": ").Append(rule.Port).Append(",\n");
+        sb.Append(pad).Append("  \"proxyType\": ").Append(rule.ProxyType).Append(",\n");
+        sb.Append(pad).Append("  \"ignoreSslCertVerification\": ").Append(rule.IgnoreSSLCertVerification ? "true" : "false").Append(",\n");
+        sb.Append(pad).Append("  \"fakeServerName\": ").Append(Quote(rule.FakeServerName)).Append(",\n");
+        sb.Append(pad).Append("  \"fakeUserAgent\": ").Append(Quote(rule.FakeUserAgent)).Append(",\n");
+
+        if (rule.Items.Count > 0)
+        {
+            sb.Append(pad).Append("  \"items\": [\n");
+            for (var i = 0; i < rule.Items.Count; i++)
+            {
+                WriteRule(sb, rule.Items[i], indent + 4);
+                if (i < rule.Items.Count - 1)
+                {
+                    sb.Append(',');
+                }
+                sb.Append('\n');
+                sb.Append(new string(' ', indent + 4)).Append("// ").Append(Describe(rule.Items[i])).Append('\n');
+            }
+            sb.Append(pad).Append("  ]\n");
+        }
+        else
+        {
+            sb.Append(pad).Append("  \"items\": []\n");
+        }
+
+        sb.Append(pad).Append('}');
+    }
+
+    /// <summary>
+    /// JSON 字符串转义。
+    /// </summary>
+    static string Quote(string? value)
+        => JsonSerializer.Serialize(value, new JsonSerializerOptions
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+
+    /// <summary>
+    /// 生成规则的中文说明。
+    /// </summary>
+    internal static string Describe(RuleEntry rule)
+    {
+        var domains = SplitDomains(rule.MatchDomainNames);
+        var domainText = domains.Count switch
+        {
+            0 => "（未指定域名）",
+            1 => domains[0],
+            <= 3 => string.Join("、", domains),
+            _ => $"{domains[0]} 等 {domains.Count} 个域名",
+        };
+
+        var target = string.IsNullOrWhiteSpace(rule.ForwardDomainNames) ? "（无转发目标）" : rule.ForwardDomainNames;
+
+        var text = rule.ProxyType switch
+        {
+            1 => $"重定向：{domainText} 的请求整体跳转到 {target}",
+            2 => $"直接成功：命中 {domainText} 后直接返回成功，不做转发",
+            3 => $"直接失败：命中 {domainText} 后直接返回失败",
+            4 => $"服务器加速：{domainText} 由加速服务器 {target} 中转",
+            _ => $"本地代理：{domainText} 直连 {target} 取数据，保留原始 Host",
+        };
+
+        if (rule.Items.Count > 0)
+        {
+            text += $"；含 {rule.Items.Count} 条更细的子规则";
+        }
+
+        return text;
+    }
+
+    static List<string> SplitDomains(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? new List<string>()
+            : value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
     /// <summary>
     /// 读取配置文件。
