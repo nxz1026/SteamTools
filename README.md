@@ -19,6 +19,9 @@
 - 内置 YARP 反向代理与自签 CA（MITM 解密），按官方加速规则把命中域名的流量转发到加速节点；
 - 可选地把系统流量引流过来：Windows 系统代理 / PAC / hosts / WinDivert 驱动级 DNS 拦截。
 
+> `system` / `pac` / `proxyonly` 三种模式监听 `--port` 指定的正向代理端口；
+> `hosts` / `dns` 两种模式由引擎在 `443` / `80` 上做反向代理（配合 hosts 改写或 DNS 拦截引流）。
+
 与上游客户端最大的结构差异：它**不再作为 GUI 主程序的 IPC 子进程**运行。
 没有命名管道、没有父进程签名校验、不需要 `modules/Accelerator/` 目录布局，可以直接运行、写进计划任务或做成服务。
 
@@ -81,7 +84,7 @@ Steam++.Accelerator.exe [选项]
 |---|---|---|
 | `system`（默认） | 设置 Windows 系统代理（`ProxyEnable` / `proxyServer` / `ProxyOverride`） | 普通用户 |
 | `pac` | 写系统 `AutoConfigURL`，由引擎自带 PAC 脚本分流 | 普通用户 |
-| `hosts` | 把规则里的监听域名指向本机并做反向代理（监听 443） | **管理员** |
+| `hosts` | 把规则里的监听域名指向本机并做反向代理（监听 443） | 普通用户 |
 | `dns` | WinDivert 驱动级 DNS 拦截 | **管理员** |
 | `proxyonly` | 只监听代理端口，不改动任何系统设置 | 普通用户 |
 
@@ -90,8 +93,12 @@ Steam++.Accelerator.exe [选项]
 几点注意：
 
 - `--ip` 默认只监听 `127.0.0.1`。改成 `0.0.0.0` 会把这个 MITM 代理暴露给同网段的所有设备，请谨慎。
-- 首次以 `system` / `hosts` / `dns` 模式运行时会生成并信任一张自签根证书（写入 `LocalMachine\Root`），因此需要管理员权限。
-- `dns` 模式依赖 `WinDivert.dll` / `WinDivert64.sys`，发布目录中已随程序附带。
+- `hosts` 模式在 `C:\Windows\System32\drivers\etc\hosts` 的 `# --- Steam++Accelerator BEGIN/END ---`
+  标记块内写入域名，退出时整块删除并还原文件原样（按字节保真，不会改动文件其它内容）。
+- `hosts` / `dns` 模式由引擎在 `443` / `80` 上做反向代理，`--port` 对这两种模式无效（仅 `system` / `pac` / `proxyonly` 使用）。
+- 首次运行会生成一张自签根证书并写入受信任的根证书存储：优先写 `LocalMachine\Root`（需管理员），
+  无管理员权限时回退到 `CurrentUser\Root`（仅对本用户生效，浏览器与 .NET 客户端同样信任）。
+- `dns` 模式依赖 `WinDivert.dll` / `WinDivert64.sys`，发布目录中已随程序附带；加载驱动需要管理员权限。
 - 程序退出时若被强杀（而非 `Ctrl+C`），`system` / `pac` 写下的注册表项不会被撤销，需要手动关闭系统代理。
 
 ## 加速规则从哪来

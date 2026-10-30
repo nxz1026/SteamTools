@@ -78,11 +78,19 @@
 - `ReverseProxySettings` 是引擎内定义的 `readonly partial record struct`（22 个字段），是引擎唯一入口，宿主只需按顺序填参。
 - `ProxyIp` 上游默认 `IPAddress.Any`；这里默认 `127.0.0.1`（只用于 Kestrel 绑定与随机端口探测）。
 - Windows 副作用原在已删除的 `ProxyService.Operate.cs` 中，现直接实现在 `Program.cs`：
-  - **system**：写 `.reg` 文本后 `regedit /s` 导入 HKCU 的 `Internet Settings`（`ProxyEnable` / `proxyServer` / `ProxyOverride`），再用 `wininet.dll` 的 `InternetSetOption`（`SETTINGS_CHANGED` / `REFRESH`）通知系统刷新；`ProxyOverride` 与上游保持一致；
+  - **system**：直接写 HKCU 的 `Internet Settings`（`ProxyEnable` / `ProxyServer` / `ProxyOverride`），
+    再用 `wininet.dll` 的 `InternetSetOption`（`SETTINGS_CHANGED` / `REFRESH`）通知系统刷新；
+    `ProxyOverride` 与上游保持一致。写入前会记录原值，退出时**还原原值**而不是清空；
   - **pac**：同一注册表位置写 `AutoConfigURL=http://<ip>:<port>/proxy.pac`。PAC 脚本由引擎自带的中间件在同一端口按需返回，无需额外托管；
-  - **hosts**：把 `ListenDomainNames ?? MatchDomainNames` 指向 `127.0.0.1`，写在 `# --- Steam++Accelerator BEGIN/END ---` 标记之间，停止时只删这段；
+  - **hosts**：把规则里的监听域名（`ListenDomainNames`，支持 `ip domain` 形式）指向 `127.0.0.1`，
+    写在 `# --- Steam++Accelerator BEGIN/END ---` 标记之间，停止时只删这段；
+    文件按字节保真读写（Latin-1 映射），不会剥掉 BOM、改写用户已有的非 ASCII 注释或吞掉末尾空行；
   - **dns**：WinDivert 由引擎自己 P/Invoke，不再需要插件里的 `WinDivertInitHelper`（那依赖插件工程的嵌入资源）；
   - **proxyonly**：不改动任何系统设置，只提示客户端把代理指过来。
+- 端口语义：引擎只在 `System` / `PAC` / `VPN` 三种模式下监听正向代理端口（`ProxyPort`）。
+  因此 **proxyonly 模式在引擎侧按 System 处理**（否则 `--port` 会被静默忽略，客户端连不上），
+  而系统副作用仍由宿主按模式决定，proxyonly 一个都不施加。
+  `hosts` / `dns` 走引擎的 `else` 分支，固定监听 `443` / `80` 做反向代理，`--port` 对这两种模式无效。
 - 退出信号用 `Console.CancelKeyPress` + `AppDomain.ProcessExit`。`CancellationTokenSource` **不能**用 `using`——
   `ProcessExit` 处理器可能在它释放之后才被回调，会抛 `ObjectDisposedException`。
 
@@ -118,6 +126,8 @@ WinDivert 包也不会被引入）。改成「或 RID 以 `win-` 开头」后，
 
 ## 6. 验证记录
 
+### 6.1 Linux（裁剪完成时）
+
 在本机（Linux arm64，.NET SDK 11.0.100-rc.3）验证：
 
 | 项目 | 结果 |
@@ -127,16 +137,43 @@ WinDivert 包也不会被引入）。改成「或 RID 以 `win-` 开头」后，
 | 运行 `--mode system --no-doh --all`（Linux） | 加载 58 条规则 |
 | `dotnet publish -c Release -f net11.0 -r win-x64 --self-contained true` | 成功产出 `Steam++.Accelerator.exe`（PE32+ x86-64），并附带 `WinDivert.dll` / `WinDivert64.sys` / `WinDivertSharp.dll` |
 
-**尚未在真实 Windows 上运行过**：注册表系统代理、hosts 写入、`X509Store(LocalMachine\Root)` 证书安装、
-WinDivert 拦截这四条路径只经过编译验证。首次在 Windows 上使用请以 `--mode proxyonly` 先行确认代理本身可用，
-再逐个尝试需要管理员权限的模式。
+### 6.2 Windows（x64，Windows 11 26300，.NET SDK 11.0.100-rc.3）
+
+| 项目 | 结果 |
+|---|---|
+| `dotnet build`（Debug / Release） | 0 错误 |
+| `dotnet publish -c Release -f net11.0 -r win-x64 --self-contained true` | 成功，产出 `Steam++.Accelerator.exe` + `WinDivert.dll` / `WinDivert64.sys` |
+| 官方规则接口 | HTTP 200、28 503 字节；默认 5 个项目启用，`--all` 启用 58 个 |
+| `--mode proxyonly --port 26590` | 监听 `http://127.0.0.1:26590`；系统代理未被改动；经该端口访问命中域名 200 |
+| `--mode system --port 26592` | 写入 `ProxyEnable=1` / `ProxyServer=127.0.0.1:26592` / `ProxyOverride`；经该端口访问命中域名 200；`Ctrl+C` 退出后注册表逐项还原为原值 |
+| `--mode pac --port 26591` | 写入 `AutoConfigURL=http://127.0.0.1:26591/proxy.pac`；`/proxy.pac` 返回 PAC 脚本；`Ctrl+C` 退出后该项被删除 |
+| `--mode hosts --port 26554` | 在 hosts 标记块内写入 15 个域名，保留文件 BOM 与 CRLF；`Ctrl+C` 退出后 hosts 文件与运行前**字节级一致** |
+| `--mode dns`（非管理员） | 引擎按预期报 `Win32Exception(5) 拒绝访问` 并中止启动（加载驱动需要管理员权限） |
+| 加速命中验证 | 本机 DNS 对 `steamcommunity.com` 返回被污染的 `162.125.1.8`，直连失败（`code=000`）；经代理命中加速节点后返回 200 |
+
+加速生效的直接证据：`steamcommunity.com` 的加速节点 `steamcommunity.rmbgame.net` 解析到 `23.200.230.67`，
+而源站在本机被解析到 Facebook 的 `162.125.1.8`；只有命中规则并转发到加速节点才能拿到 200。
+
+### 6.3 Windows 上发现并修复的问题
+
+| 问题 | 现象 | 修复 |
+|---|---|---|
+| 系统代理 / PAC 写入静默失败 | 写 `.reg` 后调 `regedit /s`，但 regedit 路径取 `SpecialFolder.System`（`C:\WINDOWS\system32`）下并不存在该文件，异常被吞掉，注册表毫无变化 | 改为直接调用 `Microsoft.Win32.Registry` 写 HKCU，不再依赖外部 regedit 进程 |
+| 退出时覆盖用户原有代理配置 | 撤销逻辑把 `ProxyServer` / `ProxyOverride` 一律清空 | 写入前记录原值，退出时逐项还原（原值不存在则删除该项） |
+| 首次运行可能永久无法启动 | `SteamTools.Certificate.cer` 存在但 `.pfx` 缺失时不会重新生成根证书，启动直接返回 `GetCertificatePackableFail` | 生成条件改为「cer 或 pfx 任一缺失即重新生成」 |
+| 非管理员无法信任根证书 | 只写 `LocalMachine\Root`，普通用户写入失败 | 写入失败时回退 `CurrentUser\Root`；检测安装状态时两个存储都算已安装 |
+| `--port` 在 proxyonly 模式被忽略 | 引擎把 proxyonly 归入反向代理分支，固定监听 `443` / `80`，客户端按提示连 `--port` 必然失败 | 引擎侧把 proxyonly 按 System 处理，系统副作用仍一个都不施加 |
+| hosts 写入破坏原文件 | `ReadAllTextAsync` 会剥掉 BOM、把用户已有的非 ASCII 注释写成乱码，并吞掉文件末尾空行；撤销后文件与原文件不一致 | 改为 Latin-1 字节保真读写，且只替换标记块；撤销后文件与原文件字节级一致 |
+| hosts 域名取值错误 | `ListenDomainNames ?? MatchDomainNames` 中前者是非空字符串，`??` 永不生效；`ListenDomainNames` 为空时静默丢域名 | 改用上游同源的 `ListeningDomainNamesArray`，并支持 `ip domain` 形式 |
 
 ## 7. 已知限制
 
 - 强杀进程（任务管理器结束）不会撤销系统代理设置；
 - 无 GUI，所有开关都在命令行；规则默认按服务端 `Checked` 启用，细粒度选择需要 `--all` 或后续补充本地规则文件；
 - `ref/` 仍以子模块方式引入上游代码，仓库不是完全自包含的；
-- 引擎自带的 SSH / Git 反向代理监听器沿用上游的「端口 22 / 9418 占用则顺延」策略。
+- 引擎自带的 SSH / Git 反向代理监听器沿用上游的「端口 22 / 9418 占用则顺延」策略；
+- `dns` 模式只在 Windows 上可用且必须以管理员身份运行（WinDivert 驱动加载权限），本轮仅验证到非管理员下按预期报错并中止；
+- 无管理员权限时根证书落在 `CurrentUser\Root`，只对该用户生效；升级到 `LocalMachine\Root` 需要管理员重跑一次。
 
 ## 8. 证据索引（均指上游裁剪前的路径）
 

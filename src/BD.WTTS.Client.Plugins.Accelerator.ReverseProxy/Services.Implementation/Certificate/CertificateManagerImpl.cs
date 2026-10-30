@@ -163,28 +163,29 @@ sealed partial class CertificateManagerImpl : ICertificateManager
                 "Could not remove certificate as it is null or empty.");
         }
 
-        using var x509Store = new X509Store(StoreName.Root, StoreLocation.LocalMachine);
+        // 根证书可能装在 LocalMachine（管理员运行）或 CurrentUser（普通用户回退），两处都要清理
+        foreach (var location in new[] { StoreLocation.LocalMachine, StoreLocation.CurrentUser })
+        {
+            RemoveTrustedRootCertificate(location);
+        }
+    }
 
+    static void RemoveTrustedRootCertificate(StoreLocation location)
+    {
         try
         {
+            using var x509Store = new X509Store(StoreName.Root, location);
             x509Store.Open(OpenFlags.ReadWrite);
             foreach (var item in x509Store.Certificates.Find(X509FindType.FindBySubjectName, CertificateConstants.RootCertificateName, false))
             {
-                //if (item.Thumbprint == RootCertificate.Thumbprint)
-                //{
                 x509Store.Remove(item);
-                //}
             }
-            //x509Store.Remove(RootCertificate);
         }
         catch (Exception e)
         {
             Log.Error(TAG, new ApplicationException(
-                "Failed to remove root certificate trust for LocalMachine store location. You may need admin rights.", e), nameof(SharedRemoveTrustedRootCertificate));
-        }
-        finally
-        {
-            x509Store.Close();
+                $"Failed to remove root certificate trust for the {location} store location. You may need admin rights.", e),
+                nameof(RemoveTrustedRootCertificate));
         }
     }
 
@@ -196,7 +197,8 @@ sealed partial class CertificateManagerImpl : ICertificateManager
         var filePath = Interface.CerFilePath;
         lock (lockGenerateCertificate)
         {
-            if (!File.Exists(filePath))
+            // pfx 是根证书本体，缺失时必须重新生成；只有 cer 存在而 pfx 缺失会导致永远无法启动
+            if (!File.Exists(filePath) || !File.Exists(Interface.PfxFilePath))
             {
                 if (!GenerateCertificateUnlock(filePath))
                     return null;

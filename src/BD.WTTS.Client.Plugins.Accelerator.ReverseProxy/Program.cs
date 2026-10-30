@@ -5,6 +5,9 @@ using BD.WTTS.Services.Implementation;
 using System.Text;
 using System.Text.Json;
 using KeyValuePair = BD.Common.Entities.KeyValuePair;
+#if WINDOWS
+using Microsoft.Win32;
+#endif
 
 // ============================================================================
 // Steam++ Accelerator —— 仅代理（反向代理）独立宿主程序
@@ -93,6 +96,11 @@ var proxyMode = proxyModeText switch
     _ => ProxyMode.System,
 };
 
+// 引擎只在 System / PAC / VPN 模式下监听正向代理端口（ProxyPort）。
+// 「仅代理」模式要的就是「在指定端口提供 HTTP 代理、但不改动任何系统设置」，
+// 因此引擎侧按 System 处理，系统副作用（注册表 / hosts / WinDivert）由下面的 switch 决定，本模式一个都不施加。
+var engineProxyMode = proxyMode == ProxyMode.ProxyOnly ? ProxyMode.System : proxyMode;
+
 var proxyPort = cli.TryGetValue("port", out var portText) && ushort.TryParse(portText, out var portValue) && portValue > 0
     ? portValue
     : proxyMode == ProxyMode.Hosts ? hostsProxyPort : defaultProxyPort;
@@ -140,7 +148,7 @@ try
         IsOnlyWorkSteamBrowser: false,
         ProxyPort: proxyPort,
         ProxyIp: proxyIp,
-        ProxyMode: proxyMode,
+        ProxyMode: engineProxyMode,
         IsProxyGOG: false,
         OnlyEnableProxyScript: false,
         EnableHttpProxyToHttps: true,
@@ -549,12 +557,18 @@ static class SystemProxyHelper
 {
     const string TAG = "SystemProxy";
 
-    const string RegistryHeader = "Windows Registry Editor Version 5.00";
-
-    const string InternetSettingsKey = @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings";
+    /// <summary>Internet Settings 注册表键（相对 HKCU）。</summary>
+    const string InternetSettingsKey = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
     /// <summary>不使用代理的地址，与上游保持一致（本地与内网直连）。</summary>
     const string ProxyOverride = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
+
+    /// <summary>
+    /// 启用前的原始值，退出时还原，避免破坏用户原有代理配置。
+    /// </summary>
+    static readonly Dictionary<string, (object? Value, RegistryValueKind Kind)> originalValues = new();
+
+    static bool originalCaptured;
 
     public static Task<bool> SetSystemProxyAsync(bool state, string? ip, int port)
     {
@@ -564,23 +578,41 @@ static class SystemProxyHelper
             return Task.FromResult(false);
         }
 
-        var proxyEnable = $"\"ProxyEnable\"=dword:{(state ? "00000001" : "00000000")}";
-        var proxyServer = state && !string.IsNullOrWhiteSpace(ip) && port > 0
-            ? $"\"ProxyServer\"=\"{ip}:{port}\""
-            : "\"ProxyServer\"=\"\"";
-        var proxyOverride = state ? $"\"ProxyOverride\"=\"{ProxyOverride}\"" : string.Empty;
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(InternetSettingsKey, writable: true);
+            if (key == null)
+            {
+                Log.Error(TAG, $"无法打开注册表项 HKCU\\{InternetSettingsKey}");
+                return Task.FromResult(false);
+            }
 
-        var contents =
-$"""
-{RegistryHeader}
+            CaptureOriginal(key);
 
-[{InternetSettingsKey}]
-{proxyEnable}
-{proxyServer}
-{(string.IsNullOrEmpty(proxyOverride) ? string.Empty : proxyOverride)}
-""";
+            if (state)
+            {
+                if (string.IsNullOrWhiteSpace(ip) || port <= 0)
+                {
+                    Log.Error(TAG, "代理地址或端口无效。");
+                    return Task.FromResult(false);
+                }
+                key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
+                key.SetValue("ProxyServer", $"{ip}:{port}", RegistryValueKind.String);
+                key.SetValue("ProxyOverride", ProxyOverride, RegistryValueKind.String);
+            }
+            else
+            {
+                RestoreOriginal(key, "ProxyEnable", "ProxyServer", "ProxyOverride");
+            }
 
-        return WriteRegistryAsync("SwitchProxy.reg", contents);
+            RefreshWinINet();
+            return Task.FromResult(true);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(TAG, ex.ToString());
+            return Task.FromResult(false);
+        }
     }
 
     public static Task<bool> SetPacAsync(bool state, string? url)
@@ -591,51 +623,77 @@ $"""
             return Task.FromResult(false);
         }
 
-        var autoConfigUrl = state && !string.IsNullOrWhiteSpace(url)
-            ? $"\"AutoConfigURL\"=\"{url}\""
-            : "\"AutoConfigURL\"=\"\"";
-
-        var contents =
-$"""
-{RegistryHeader}
-
-[{InternetSettingsKey}]
-{autoConfigUrl}
-""";
-
-        return WriteRegistryAsync("SwitchPacProxy.reg", contents);
-    }
-
-    static async Task<bool> WriteRegistryAsync(string fileName, string contents)
-    {
         try
         {
-            var path = Path.Combine(IOPath.CacheDirectory, fileName);
-            await File.WriteAllTextAsync(path, contents, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            using var key = Registry.CurrentUser.CreateSubKey(InternetSettingsKey, writable: true);
+            if (key == null)
+            {
+                Log.Error(TAG, $"无法打开注册表项 HKCU\\{InternetSettingsKey}");
+                return Task.FromResult(false);
+            }
 
-            // HKCU 无需管理员权限；regedit /s 静默导入
-            var startInfo = new ProcessStartInfo
+            CaptureOriginal(key);
+
+            if (state)
             {
-                FileName = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.System),
-                    "regedit.exe"),
-                Arguments = $"/s \"{path}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            using var process = Process.Start(startInfo);
-            if (process != null)
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    Log.Error(TAG, "PAC 地址无效。");
+                    return Task.FromResult(false);
+                }
+                key.SetValue("AutoConfigURL", url, RegistryValueKind.String);
+            }
+            else
             {
-                await process.WaitForExitAsync();
+                RestoreOriginal(key, "AutoConfigURL");
             }
 
             RefreshWinINet();
-            return true;
+            return Task.FromResult(true);
         }
         catch (Exception ex)
         {
             Log.Error(TAG, ex.ToString());
-            return false;
+            return Task.FromResult(false);
+        }
+    }
+
+    /// <summary>
+    /// 记录首次修改前的原始值（只记录一次）。
+    /// </summary>
+    static void CaptureOriginal(RegistryKey key)
+    {
+        if (originalCaptured)
+        {
+            return;
+        }
+        originalCaptured = true;
+
+        foreach (var name in new[] { "ProxyEnable", "ProxyServer", "ProxyOverride", "AutoConfigURL" })
+        {
+            var value = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+            if (value != null)
+            {
+                originalValues[name] = (value, key.GetValueKind(name));
+            }
+        }
+    }
+
+    /// <summary>
+    /// 还原原始值；原本不存在的值则删除。
+    /// </summary>
+    static void RestoreOriginal(RegistryKey key, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (originalValues.TryGetValue(name, out var original) && original.Value != null)
+            {
+                key.SetValue(name, original.Value, original.Kind);
+            }
+            else
+            {
+                key.DeleteValue(name, throwOnMissingValue: false);
+            }
         }
     }
 
@@ -692,14 +750,29 @@ static class HostsFileHelper
     {
         try
         {
-            var domains = projects
-                .SelectMany(x => (x.ListenDomainNames ?? x.MatchDomainNames ?? string.Empty).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                .Where(x => x.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
+            // 与上游一致：使用监听域名（ListenDomainNames），并支持 "ip domain" 形式指定单独的目标地址
+            var entries = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var project in projects)
+            {
+                foreach (var host in project.ListeningDomainNamesArray)
+                {
+                    if (string.IsNullOrWhiteSpace(host))
+                    {
+                        continue;
+                    }
+                    if (host.Contains(' '))
+                    {
+                        var parts = host.Split(' ', 2);
+                        entries[parts[1].Trim()] = parts[0].Trim();
+                    }
+                    else
+                    {
+                        entries[host.Trim()] = ip;
+                    }
+                }
+            }
 
-            if (domains.Length <= 0)
+            if (entries.Count <= 0)
             {
                 Log.Warn(TAG, "没有可写入 hosts 的域名。");
                 return false;
@@ -708,9 +781,9 @@ static class HostsFileHelper
             var lines = new List<string>
             {
                 BeginTag,
-                "# 由 Steam++ Accelerator 自动生成，请勿手动修改",
+                "# Auto-generated by Steam++ Accelerator. Do not edit manually.",
             };
-            lines.AddRange(domains.Select(x => $"{ip} {x}"));
+            lines.AddRange(entries.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase).Select(x => $"{x.Value} {x.Key}"));
             lines.Add(EndTag);
 
             return await UpdateAsync(lines);
@@ -735,11 +808,16 @@ static class HostsFileHelper
                 return false;
             }
 
-            var content = await File.ReadAllTextAsync(hostsFilePath);
-            var lines = content.Replace("\r\n", "\n").Split('\n').ToList();
+            // hosts 文件由系统按 ANSI/UTF-8 混合读取；这里按 Latin-1 做字节保真的读写，
+            // 避免剥掉 BOM、把用户原有的非 ASCII 注释改写成乱码，或吞掉文件末尾的空行。
+            // 只替换 BEGIN/END 标记之间的内容，其余部分原样保留。
+            var rawBytes = await File.ReadAllBytesAsync(hostsFilePath);
+            var content = Encoding.Latin1.GetString(rawBytes);
+            var lines = content.Split('\n').ToList();
+            var lineEnding = content.Contains("\r\n", StringComparison.Ordinal) ? "\r" : string.Empty;
 
-            var beginIndex = lines.FindIndex(x => x.Trim() == BeginTag);
-            var endIndex = lines.FindIndex(x => x.Trim() == EndTag);
+            var beginIndex = lines.FindIndex(x => x.TrimEnd('\r').Trim() == BeginTag);
+            var endIndex = lines.FindIndex(x => x.TrimEnd('\r').Trim() == EndTag);
             if (beginIndex >= 0 && endIndex > beginIndex)
             {
                 lines.RemoveRange(beginIndex, endIndex - beginIndex + 1);
@@ -748,11 +826,11 @@ static class HostsFileHelper
             if (block.Count > 0)
             {
                 var insertIndex = lines.FindLastIndex(x => !string.IsNullOrWhiteSpace(x)) + 1;
-                lines.InsertRange(insertIndex, block);
+                lines.InsertRange(insertIndex, block.Select(x => x + lineEnding));
             }
 
-            var result = string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine;
-            await File.WriteAllTextAsync(hostsFilePath, result, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var result = string.Join("\n", lines);
+            await File.WriteAllBytesAsync(hostsFilePath, Encoding.Latin1.GetBytes(result));
 
             Log.Info(TAG, $"hosts 已更新: {hostsFilePath} ({block.Count} 行)");
             return true;

@@ -30,9 +30,23 @@ public interface ICertificateManager
             }
             else
             {
-                using var store = new X509Store(StoreName.Root, StoreLocation.LocalMachine);
+                // 本机（LocalMachine）与当前用户（CurrentUser）两个根证书存储都算已安装
+                return IsCertificateInStore(StoreLocation.LocalMachine, certificate2)
+                    || IsCertificateInStore(StoreLocation.CurrentUser, certificate2);
+            }
+        }
+
+        static bool IsCertificateInStore(StoreLocation location, X509Certificate2 certificate2)
+        {
+            try
+            {
+                using var store = new X509Store(StoreName.Root, location);
                 store.Open(OpenFlags.ReadOnly);
                 return store.Certificates.Contains(certificate2);
+            }
+            catch (Exception)
+            {
+                return false;
             }
         }
 
@@ -52,6 +66,31 @@ public interface ICertificateManager
             return isInstalled;
         }
 
+        /// <summary>
+        /// 将证书写入指定位置的根证书存储，返回是否已安装成功。
+        /// </summary>
+        static bool TryTrustRootCertificate(StoreLocation location, X509Certificate2 certificate2)
+        {
+            try
+            {
+                using var store = new X509Store(StoreName.Root, location);
+                store.Open(OpenFlags.ReadWrite);
+
+                var findCerts = store.Certificates.Find(X509FindType.FindByThumbprint, certificate2.Thumbprint, true);
+                if (!findCerts.Any())
+                {
+                    store.Add(certificate2);
+                }
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log.Error(nameof(ICertificateManager), e,
+                    $"Failed to trust the root certificate in the {location} root store.");
+                return false;
+            }
+        }
+
         internal static void TrustRootCertificate(
             Func<string?> getCerFilePath,
             IPCPlatformService platformService,
@@ -59,21 +98,14 @@ public interface ICertificateManager
         {
             if (OperatingSystem.IsWindows())
             {
-                using var store = new X509Store(StoreName.Root, StoreLocation.LocalMachine);
-                try
+                // 优先写入本机（LocalMachine）根证书存储；无管理员权限时回退到当前用户（CurrentUser）存储
+                if (!TryTrustRootCertificate(StoreLocation.LocalMachine, certificate2))
                 {
-                    store.Open(OpenFlags.ReadWrite);
-
-                    var findCerts = store.Certificates.Find(X509FindType.FindByThumbprint, certificate2.Thumbprint, true);
-                    if (!findCerts.Any())
+                    if (!TryTrustRootCertificate(StoreLocation.CurrentUser, certificate2))
                     {
-                        store.Add(certificate2);
+                        Log.Error(nameof(ICertificateManager),
+                            "Please manually install the CA certificate to a trusted root certificate authority.");
                     }
-                }
-                catch (Exception e)
-                {
-                    Log.Error(nameof(ICertificateManager), e,
-                        "Please manually install the CA certificate to a trusted root certificate authority.");
                 }
             }
             else if (OperatingSystem.IsMacOS())
