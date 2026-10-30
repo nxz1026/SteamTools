@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using KeyValuePair = BD.Common.Entities.KeyValuePair;
 #if WINDOWS
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 #endif
 
@@ -141,6 +142,11 @@ var sideEffectApplied = false;
 // 宿主目录必须在使用 IOPath.AppDataDirectory 之前初始化
 IOPath.InitFileSystem(GetAppDataDirectory, GetCacheDirectory);
 InitNLog();
+
+// DNS 拦截模式会把命中域名的解析结果改写成 127.0.0.1。若上次运行是被强杀（任务管理器结束），
+// 系统 DNS 缓存里会残留这些假 IP，导致「程序已退出但网站仍连不上」。
+// 启动前先清一次缓存，避免继承上次的残留。
+FlushDnsCache();
 
 // 规则配置文件路径；--rules 可指定其它位置
 var ruleConfigPath = GetString(cli, "rules") ?? Path.Combine(IOPath.AppDataDirectory, RuleConfigFileName);
@@ -284,6 +290,11 @@ try
     }
 
     await reverseProxyService.StopProxyAsync();
+
+    // 退出后再清一次 DNS 缓存：DNS 拦截期间命中域名的解析结果被改写成了 127.0.0.1，
+    // 不清掉的话系统会继续用这些假 IP，表现为「程序退出了但网站还是连不上」。
+    FlushDnsCache();
+
     Console.WriteLine("已退出。");
 }
 catch (Exception ex)
@@ -331,6 +342,32 @@ static string GetCacheDirectory()
     Directory.CreateDirectory(dir);
     return dir;
 }
+
+/// <summary>
+/// 清理系统 DNS 解析缓存。
+/// <para>
+/// DNS 拦截模式会把命中域名的应答改写成 127.0.0.1。这些假 IP 会留在系统缓存里，
+/// 程序退出后仍被复用，表现为「程序停了但网站连不上」。清缓存可消除该残留。
+/// </para>
+/// </summary>
+static void FlushDnsCache()
+{
+#if WINDOWS
+    try
+    {
+        DnsFlushResolverCache();
+    }
+    catch (Exception ex)
+    {
+        Log.Warn(tag, $"清理 DNS 缓存失败: {ex.Message}");
+    }
+#endif
+}
+
+#if WINDOWS
+[DllImport("dnsapi.dll", EntryPoint = "DnsFlushResolverCache", SetLastError = true)]
+static extern void DnsFlushResolverCache();
+#endif
 
 static void InitNLog()
 {

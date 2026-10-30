@@ -57,6 +57,10 @@
 
 - `ReverseProxySettings` 是引擎内定义的 `readonly partial record struct`（22 个字段），是引擎唯一入口。
 - `ProxyIp` 上游默认 `IPAddress.Any`；这里默认 `127.0.0.1`。
+- **DNS 缓存**：DNS 拦截把命中域名的应答改写成 `127.0.0.1`，这些假 IP 会留在系统 DNS 缓存里。
+  程序退出后若不清缓存，系统继续用假 IP，表现为「程序停了但网站连不上」——
+  浏览器连的是 `127.0.0.1:443`，而此时反代已经没了。宿主在启动前与退出后各调一次
+  `DnsFlushResolverCache` 清理，强杀场景则由下次启动的清理兜住。
 - 退出信号用 `Console.CancelKeyPress` + `AppDomain.ProcessExit`。`CancellationTokenSource` **不能**用 `using`——
   `ProcessExit` 处理器可能在它释放之后才被回调，会抛 `ObjectDisposedException`。
 - **端口语义**：引擎只在 `System` / `PAC` / `VPN` 三种模式下监听正向代理端口（`ProxyPort`）。
