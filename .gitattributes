@@ -1,0 +1,3 @@
+# Windows 批处理必须以 CRLF 检出：LF 会让 goto / label 分支解析出错
+*.bat text eol=crlf
+*.cmd text eol=crlf

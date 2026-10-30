@@ -123,9 +123,24 @@
 官方接口 `POST https://api.steampp.net/accelerator/projectgroups` 匿名可用，返回
 `{"🦓": [...], "🦄": 200, "🐴": null}` 包装的 58 个顶层项目（含子项 62 个节点）。
 
-规则集里 `Google(Recaptcha) 验证码` 匹配 `google.com`、转发到 `www.recaptcha.net`，
-命中后 Google 首页返回 404——这是**唯一匹配 `google.com` 的规则**，
-即 `google.com` 本身无法加速，只有 API / 字体类域名能加速。详见 README。
+### 转发目标来自规则本身，不是统一配置
+
+**没有「一台加速服务器」这种配置项。** 每条规则自带 `forwardDomainNames`，跟着规则集下发。
+17 条默认启用规则里，12 条是 CNAME 别名（`*.rmbgame.net` 指回 Akamai / GitHub 真身，
+绕的是 DNS 污染而非网络封锁）、5 条是裸 IP 直连、1 条第三方反代
+（`cdn.queniuqe.com`，当前 DNS 解析失败，实际空转）。
+`proxyType` 分布 `0`=46 / `1`=11 / `4`=1，**没有 `3`（服务端代理）**，
+所以 `ServerSideProxyToken` 恒为 `null` 不影响功能。
+
+完整数据、解析链证据与延迟实测见 **[`accelerate-nodes.md`](./accelerate-nodes.md)**。
+
+### Google 无法加速
+
+规则集里 4 条 Google 相关规则**全部 `enabled: false`**。其中唯一匹配 `google.com` 的是
+`Google(Recaptcha) 验证码`，转发到 `www.recaptcha.net`——那是 Google 给验证码场景准备的
+独立域名，**没有搜索**。所以启用它并不能访问 Google 搜索，预期只会得到 recaptcha 站点
+（该行为未实测，属推断）。能加速的只有 `ajax.googleapis.com` / `fonts.googleapis.com` /
+`themes.googleusercontent.com` 这类 API 与静态资源镜像。
 
 ## 5. 跨平台条件编译
 

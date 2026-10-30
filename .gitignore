@@ -645,3 +645,6 @@ iOSInjectionProject/
 dist/
 # dotnet publish 输出（如 publish-win-x64/）
 publish-*/
+
+# AI 工作区本地记忆，不入库
+.workbuddy/
