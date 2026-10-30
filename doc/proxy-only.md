@@ -50,7 +50,7 @@
 6. 加载加速规则；
 7. 组装 `ReverseProxySettings` → `Serializable.SMP2(...)` → `StartProxyAsync(byte[])`；
 8. 按模式施加系统副作用；
-9. 等待 `Ctrl+C` / 进程退出信号；
+9. 创建托盘图标并隐藏控制台窗口，等待托盘「退出」/ `Ctrl+C` / 进程退出信号；
 10. 先撤销副作用，再 `StopProxyAsync()`，最后 `await Ioc.DisposeAsync()`。
 
 ### 实现约束
@@ -79,6 +79,26 @@
 - **根证书**：优先写 `LocalMachine\Root`（需管理员），失败回退 `CurrentUser\Root`；
   检测安装状态时两个存储都算已安装。`cer` 或 `pfx` 任一缺失即重新生成——
   只有 `cer` 存在而 `pfx` 缺失会导致永远无法启动。
+
+### 托盘图标（`TrayIcon.cs`）
+
+纯 Win32（`Shell_NotifyIcon` + 自建消息窗口），**不引入 WinForms**：WinForms 会把工程从裸 TFM
+`net11.0` 变成 `net11.0-windows`，破坏 §5 里那条「非 Windows 主机交叉编译 win-x64」的能力。
+
+| 点 | 实现 | 原因 |
+|---|---|---|
+| 窗口 | 顶层窗口 + `WS_EX_TOOLWINDOW`，类名 `SteamPPAcceleratorTray_{pid}` | 不进任务栏/Alt-Tab，但句柄仍可被 `FindWindowEx` 定位（`HWND_MESSAGE` 窗口跨进程定位不到） |
+| 菜单 | `TrackPopupMenu` 带 `TPM_RETURNCMD` | 不带时返回 0，选中项改走 `WM_COMMAND`，在菜单的嵌套消息循环里同步触发退出 → 托盘线程卡死 → 进程退出阶段撞 CLR 断言 |
+| 退出 | `PostThreadMessage(WM_QUIT)` | 直接结束消息循环，不在 `WM_DESTROY` 分发里执行托管代码 |
+| 释放顺序 | `tray.Dispose()` 必须早于 `Ioc.DisposeAsync()` | 反了会让 `Log.Info` 撞已释放的 `LoggerFactory`（`ObjectDisposedException`） |
+| 控制台隐藏 | `GetConsoleWindow()` + `GetConsoleProcessList` 判断控制台是否独占 | 共享终端时不隐藏，避免藏掉用户自己的窗口 |
+
+**控制台隐藏的前提**：进程必须是该控制台的唯一使用者。因此外部启动脚本要用
+`start "" "%EXE%"` 让它拿独立控制台；同步调用（`"%EXE%" --mode system`）会让 exe 与 `cmd.exe`
+共用控制台，`GetConsoleProcessList` 返回 2，程序按设计拒绝隐藏——窗口留在屏幕上，
+自动隐藏形同失效。
+
+**`launch.bat` 已改为 `start ""` 拉起的非阻塞方式**，且不再 `pause`（窗口会自己关掉）。
 
 ## 4. 加速规则
 
@@ -136,6 +156,10 @@ Windows 11 x64 + .NET SDK 11.0.100-rc.3：
 | `--mode dns`（管理员） | 成功加载 WinDivert；`github.com` / `api.github.com` / `store.steampowered.com` / `steamcommunity.com` 的 DNS 应答被改写为 `127.0.0.1` / `::1`；经本机 443 反代访问上述站点均返回 200 |
 | 加速命中 | 本机 DNS 对 `steamcommunity.com` 返回被污染的 `162.125.1.8`，直连失败（`code=000`）；经代理命中加速节点 `23.200.230.67` 后返回 200 |
 | 规则配置 | 改 `enabled` 后重启即生效且不联网；`--refresh-rules` 保留用户改动；配置损坏时报错退出且不覆盖原文件 |
+| 托盘注册（self-contained 发布版） | 托盘窗口 `SteamPPAcceleratorTray_{pid}` 创建成功；UI Automation 从托盘区读出 `Steam++ Accelerator (System)` |
+| 托盘菜单 | `MN_GETHMENU` 取到菜单，3 项：`显示控制台` / 分隔符 / `退出`；项矩形 152×22 |
+| 托盘退出 | 点「退出」后进程 1s 内退出、`ProxyEnable=0`、`ProxyServer`/`ProxyOverride` 删除、26501 端口释放 |
+| 异常路径回滚 | 人为在「系统代理已写入」之后抛异常：进程 `ExitCode=500`，且 `ProxyEnable` 仍被还原为 0 |
 
 ### 修复过的问题
 
@@ -149,10 +173,17 @@ Windows 11 x64 + .NET SDK 11.0.100-rc.3：
 | hosts 写入破坏原文件 | `ReadAllTextAsync` 剥掉 BOM、把非 ASCII 注释写成乱码、吞掉末尾空行 | 改为 Latin-1 字节保真读写，只替换标记块 |
 | hosts 域名取值错误 | `ListenDomainNames ?? MatchDomainNames` 中前者是非空字符串，`??` 永不生效 | 改用 `ListeningDomainNamesArray`，支持 `ip domain` 形式 |
 | 配置注释导致改动丢失 | 写入的 `//` 注释使 `JsonSerializer` 解析失败，程序随后把配置重置回默认 | 开 `ReadCommentHandling = Skip`；配置损坏时报错退出不覆盖 |
+| 托盘图标不出现 | `RegisterClassEx` 缺 `CharSet.Unicode`，实际调用 ANSI 版注册类名，与 `CreateWindowExW` 的类名对不上，窗口创建失败 | 补 `CharSet = CharSet.Unicode` |
+| 点「退出」托盘线程卡死 → CLR 断言 | `TrackPopupMenu` 缺 `TPM_RETURNCMD`，选中项在嵌套消息循环里同步触发退出 | 加 `TPM_RETURNCMD`，改由返回值分派 |
+| 退出时 `ObjectDisposedException` 杀进程 | `finally` 里先释放 `Ioc` 再释放托盘，`Log.Info` 撞已释放的 `LoggerFactory` | 调整顺序：`tray.Dispose()` 先于 `Ioc.DisposeAsync()` |
+| 发布版启动即退（`ExitCode=500`） | `GetConsoleWindow` 被 `DllImport` 到 `user32.dll`，该函数实际在 `kernel32.dll`，隐藏控制台时抛 `EntryPointNotFoundException`；且异常路径不撤销代理，留下 `ProxyEnable=1` 指向已停止的端口 | 改 `kernel32.dll`；把副作用撤销抽成 `RevertSideEffectsAsync()`，`catch` 里也调用 |
+| 自动隐藏永远不生效 | `launch.bat` 同步启动 exe，与 `cmd.exe` 共用控制台，`GetConsoleProcessList` 返回 2，程序按设计拒绝隐藏 | 启动脚本改 `start "" "%EXE%"` 拿到独立控制台，并去掉 `pause` |
 
 ## 7. 已知限制
 
 - 强杀进程（任务管理器结束）不会撤销系统代理设置；
+- 控制台自动隐藏只在程序**独占**控制台时生效；从已有终端同步运行时窗口会保留（这是有意的，
+  否则会把用户自己的终端藏掉）；
 - 无 GUI，所有开关都在命令行或规则配置文件；
 - `ref/` 仍以子模块方式引入上游代码，仓库不是完全自包含的；
 - 引擎自带的 SSH / Git 反向代理监听器沿用上游的「端口 22 / 9418 占用则顺延」策略；

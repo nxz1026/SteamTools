@@ -118,6 +118,9 @@ var useDoh = !cli.ContainsKey("no-doh");
 var loadAllRules = cli.ContainsKey("all");
 var refreshRules = cli.ContainsKey("refresh-rules");
 
+// --console 保持控制台窗口可见（默认启动成功后转入托盘并隐藏窗口）
+var keepConsole = cli.ContainsKey("console");
+
 // --exclude 可重复，按加速项目名排除规则（直接从原始参数扫描，避免被参数字典覆盖）
 var excludedRuleNames = new List<string>();
 for (var i = 0; i < args.Length; i++)
@@ -138,6 +141,7 @@ for (var i = 0; i < args.Length; i++)
 
 var exitCode = 0;
 var sideEffectApplied = false;
+var sideEffectsReverted = false;
 
 // 宿主目录必须在使用 IOPath.AppDataDirectory 之前初始化
 IOPath.InitFileSystem(GetAppDataDirectory, GetCacheDirectory);
@@ -158,6 +162,34 @@ Console.WriteLine($"  dns       : {proxyDns}{(useDoh ? " (DoH)" : string.Empty)}
 Console.WriteLine($"  appdata   : {IOPath.AppDataDirectory}");
 Console.WriteLine($"  rules     : {ruleConfigPath}");
 Console.WriteLine();
+
+// 托盘图标在 try 块内创建，但需要在 finally 中释放，故声明在此处
+TrayIcon? tray = null;
+var consoleHidden = false;
+
+// 撤销系统级副作用。正常退出与异常退出共用同一入口：
+// 若只在正常路径撤销，启动后期抛异常会留下 ProxyEnable=1 指向已停止的端口，用户整机断网。
+async Task RevertSideEffectsAsync()
+{
+    if (!sideEffectApplied || sideEffectsReverted)
+    {
+        return;
+    }
+    sideEffectsReverted = true;
+
+    switch (proxyMode)
+    {
+        case ProxyMode.System:
+            await SystemProxyHelper.SetSystemProxyAsync(false, null, 0);
+            break;
+        case ProxyMode.PAC:
+            await SystemProxyHelper.SetPacAsync(false, null);
+            break;
+        case ProxyMode.Hosts:
+            await HostsFileHelper.RevertAsync();
+            break;
+    }
+}
 
 try
 {
@@ -242,8 +274,6 @@ try
     }
 
     Console.WriteLine(sideEffectApplied ? "已应用系统设置。" : "警告：应用系统设置失败，请检查权限。");
-    Console.WriteLine("按 Ctrl+C 停止并退出。");
-    Console.WriteLine();
 
     // 注意：不能使用 using，ProcessExit 处理器在 CTS 释放后仍可能被回调
     var shutdown = new CancellationTokenSource();
@@ -265,6 +295,55 @@ try
         RequestShutdown();
     };
     AppDomain.CurrentDomain.ProcessExit += (_, _) => RequestShutdown();
+
+    // 启动成功后转入系统托盘：隐藏控制台窗口，右键图标可「显示控制台」或「退出」
+    try
+    {
+        var exePath = TrayIcon.ResolveExecutablePath();
+        if (!string.IsNullOrWhiteSpace(exePath))
+        {
+            var candidate = new TrayIcon($"Steam++ Accelerator ({proxyMode})", exePath);
+            candidate.ExitRequested = RequestShutdown;
+            candidate.ShowConsoleRequested = () => TrayIcon.ShowConsoleWindow();
+            if (candidate.Start())
+            {
+                tray = candidate;
+            }
+            else
+            {
+                candidate.Dispose();
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Log.Error(tag, $"创建托盘图标失败: {ex.Message}");
+        tray = null;
+    }
+
+    if (tray != null)
+    {
+        Console.WriteLine("已转入系统托盘，右键图标可「显示控制台」或「退出」。");
+#if DEBUG
+        // Debug 构建保留控制台输出，便于观察日志
+        consoleHidden = false;
+        Console.WriteLine("（Debug 构建：保持窗口可见）");
+#else
+        consoleHidden = !keepConsole && TrayIcon.HideConsoleWindow();
+        if (!consoleHidden)
+        {
+            Console.WriteLine(keepConsole
+                ? "（--console：保持窗口可见）"
+                : "（当前终端被其它进程共用，未隐藏窗口；托盘图标仍可退出）");
+        }
+#endif
+    }
+    else
+    {
+        Console.WriteLine("按 Ctrl+C 停止并退出。");
+    }
+    Console.WriteLine();
+
     try
     {
         await Task.Delay(Timeout.Infinite, shutdown.Token);
@@ -273,21 +352,16 @@ try
     {
     }
 
+    // 从托盘退出时控制台是隐藏的，先恢复显示，否则下面的清理过程用户看不到
+    if (consoleHidden)
+    {
+        TrayIcon.ShowConsoleWindow();
+    }
+
     Console.WriteLine("正在停止代理...");
 
     // 先撤销系统级副作用，再停止引擎
-    switch (proxyMode)
-    {
-        case ProxyMode.System:
-            await SystemProxyHelper.SetSystemProxyAsync(false, null, 0);
-            break;
-        case ProxyMode.PAC:
-            await SystemProxyHelper.SetPacAsync(false, null);
-            break;
-        case ProxyMode.Hosts:
-            await HostsFileHelper.RevertAsync();
-            break;
-    }
+    await RevertSideEffectsAsync();
 
     await reverseProxyService.StopProxyAsync();
 
@@ -301,9 +375,22 @@ catch (Exception ex)
 {
     Console.Error.WriteLine(ex.ToString());
     exitCode = 500;
+
+    // 异常也可能发生在上完系统代理之后（例如托盘初始化），必须照样撤销，
+    // 否则进程没了但 ProxyEnable 仍指向已停止的端口 → 整机断网。
+    try
+    {
+        await RevertSideEffectsAsync();
+    }
+    catch (Exception revertEx)
+    {
+        Console.Error.WriteLine($"撤销系统设置失败: {revertEx.Message}");
+    }
 }
 finally
 {
+    // 先释放托盘：它的清理日志依赖尚未释放的 LoggerFactory
+    tray?.Dispose();
     try
     {
         await Ioc.DisposeAsync();
@@ -311,9 +398,6 @@ finally
     catch
     {
     }
-#if DEBUG
-    Console.ReadLine();
-#endif
 }
 
 return exitCode;
@@ -627,6 +711,7 @@ static void PrintUsage()
     Console.WriteLine("  --exclude <项目名>[,<项目名>...]        按项目名排除规则，可重复指定");
     Console.WriteLine("  --rules <路径>                          指定规则配置文件，默认 <数据目录>\\accelerate-rules.json");
     Console.WriteLine("  --refresh-rules                         从官方接口重新拉取规则并更新配置文件（保留已改动的开关）");
+    Console.WriteLine("  --console                               保持控制台窗口可见（默认启动成功后转入托盘并隐藏窗口）");
     Console.WriteLine("  --help                                   显示帮助");
 }
 

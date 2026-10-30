@@ -643,3 +643,5 @@ iOSInjectionProject/
 
 # 本地打包产物
 dist/
+# dotnet publish 输出（如 publish-win-x64/）
+publish-*/
