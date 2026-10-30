@@ -135,6 +135,31 @@ Steam++.Accelerator.exe --mode dns --all --exclude "Google(Recaptcha) 验证码"
 > 注意：规则的匹配字段是 `MatchDomainNames`，按 `^` 锚定的正则匹配，因此
 > `raw.githubusercontent.com` 这类域名不在规则的匹配范围内，走直连，不受影响。
 
+### 关于 Google
+
+规则集里 Google 相关的项分两类，**只有 API / 字体类能真正加速**：
+
+| 项目名 | 匹配域名 | 转发目标 | 效果 |
+|---|---|---|---|
+| `Google(Recaptcha) 验证码` | `google.com` | `www.recaptcha.net` | ❌ Google 首页变成 404，**必须排除** |
+| `ajax.googleapis.com` | `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | ✅ 走中国镜像 |
+| `fonts.googleapis.com` | `fonts.googleapis.com` | `fonts.font.im` | ✅ 走中国镜像 |
+| `fonts.gstatic.com` | `fonts.gstatic.com` | `gstatic.loli.net` | ✅ 走中国镜像 |
+| `themes.googleusercontent.com` | `themes.googleusercontent.com` | `themes.loli.net` | ✅ 走中国镜像 |
+
+**`google.com` / `www.google.com` 本身无法加速**——规则集里唯一匹配它的那条是验证码规则，
+用途是让页面里的 reCAPTCHA 组件能加载，而不是把 Google 搜索结果代理出来。
+排除这条规则后 `google.com` 走直连（是否可达取决于你本机网络）。
+
+实测（`--all --exclude "Google(Recaptcha) 验证码"`）：
+
+| 域名 | 转发到 | 结果 |
+|---|---|---|
+| `ajax.googleapis.com` | `ajax.proxy.ustclug.org` | 200 |
+| `fonts.googleapis.com` | `fonts.font.im` | 200 |
+| `fonts.gstatic.com` | `gstatic.loli.net` | 200 |
+| `google.com` | （直连，不劫持） | 走本机网络 |
+
 ## 数据目录与日志
 
 | 平台 | 路径 |

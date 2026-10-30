@@ -118,6 +118,11 @@ Content-Type: application/json
 - 原始 JSON 缓存在 `<数据目录>/accelerate-projects.json`，接口不可用时用缓存兜底。
 - 规则的匹配字段是 `MatchDomainNames`，`DomainPattern` 用 `^` 锚定的正则匹配，
   因此 `raw.githubusercontent.com` 这类域名不在匹配范围内，走直连。
+- **Google 只能加速 API / 字体类域名**（`ajax.googleapis.com` → `ajax.proxy.ustclug.org`、
+  `fonts.googleapis.com` → `fonts.font.im`、`fonts.gstatic.com` → `gstatic.loli.net`、
+  `themes.googleusercontent.com` → `themes.loli.net`，实测均 200）；
+  `google.com` / `www.google.com` 本身无法加速——规则集里唯一匹配它的是验证码规则，
+  转发到 `www.recaptcha.net`，命中后首页返回 404（`Server: ESF`），必须排除。
 
 ## 5. 跨平台条件编译
 
