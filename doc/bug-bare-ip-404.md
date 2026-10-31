@@ -1,6 +1,6 @@
 # 裸 IP 经代理返回 404（自建服务器无法访问）
 
-> 状态：已定位根因并修复源码，待有 .NET SDK 的环境重新发布验证。
+> 状态：已构建（自包含 net11.0）并实测验证通过。修复后裸 IP 经代理不再 404，已正确转发到服务器（返回 401 为服务器自身 `/` 鉴权行为，直连同样 401）。
 
 ## 一、现象
 
@@ -45,23 +45,38 @@
    - `ConnectAsync`：对**裸 IP 目标**放宽客户端证书校验（自建服务器常用自签 / IP-SAN 证书，
      严格校验会二次失败），域名目标仍走原有 `ValidateServerCertificate`。
 
-## 四、验证
+## 四、验证（已实测通过）
 
-在有 .NET SDK 的机器重新发布后：
+构建环境原本只有 .NET 8 runtime、无 SDK，故安装 .NET 11 SDK 并采用**自包含**发布（保证双击即用、不依赖全局 net11 runtime）：
 
 ```powershell
-# 发布（框架依赖，SelfContained=false）
-dotnet publish src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/ `
-  -c Release -r win-x64 -o C:\SteamToolsAccelerator
+# 安装 SDK（仅需一次）
+Invoke-WebRequest https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
+& .\dotnet-install.ps1 -Channel 11.0 -InstallDir E:\dotnet11 -NoPath
 
-# 启动
-Start-Process C:\SteamToolsAccelerator\Steam++.Accelerator.exe -ArgumentList '--mode system'
+# 自包含发布（项目被判定多目标框架，必须加 -f net11.0）
+E:\dotnet11\dotnet.exe publish src/BD.WTTS.Client.Plugins.Accelerator.ReverseProxy/ `
+  -c Release -f net11.0 -r win-x64 -p:SelfContained=true -o E:\SteamToolsPublish
 
-# 经代理访问裸 IP，应返回 200（修复前为 404）
-curl -k -x http://127.0.0.1:26501 https://140.83.62.161/
+# 部署：整体覆盖 C:\SteamToolsAccelerator（建议先备份旧目录）
+Copy-Item E:\SteamToolsPublish\* C:\SteamToolsAccelerator\ -Recurse -Force
 ```
 
-预期结果：`code=200`。退出代理会自动还原系统代理（`ProxyEnable=0`、`ProxyServer`/`ProxyOverride` 删除）。
+启动（与桌面快捷方式 `Steam++ 加速.bat` 同参数）：
+
+```powershell
+Start-Process C:\SteamToolsAccelerator\Steam++.Accelerator.exe -ArgumentList '--mode system'
+```
+
+经代理访问对比（curl 走 `127.0.0.1:26501`）：
+
+| 目标 | 修复前（经代理） | 修复后（经代理） | 直连（关代理） |
+| --- | --- | --- | --- |
+| `https://140.83.62.161/`（裸 IP，自建服务器） | **404（代理丢弃）** | **401（已转发到服务器）** | 401 |
+| `https://example.com/` | 200 | 200 | 200 |
+| `https://github.com/`（加速） | 200 | 200 | — |
+
+实测结论：修复后代理正确转发裸 IP，不再返回 404；经代理与直连均返回 401，说明 401 是服务器自身 `/` 需要鉴权，与代理无关。退出代理会自动还原系统代理（`ProxyEnable=0`、`ProxyServer` 删除）。
 
 ## 五、临时绕过（不想改代码时）
 
