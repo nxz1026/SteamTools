@@ -308,10 +308,15 @@ sealed class ReverseProxyHttpClientHandler : DelegatingHandler
         }
         var tlsSniValue = requestContext.TlsSniValue.WithIPAddress(ipEndPoint.Address);
         var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+        // 裸 IP 目标（如用户自建服务器常用自签 / IP-SAN 证书）放宽证书校验，
+        // 避免默认直连转发因客户端侧严格校验而二次失败。域名目标仍走原有校验逻辑。
+        var acceptAllCerts = IPAddress.TryParse(context.DnsEndPoint.Host, out _);
         await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
         {
             TargetHost = tlsSniValue.Value,
-            RemoteCertificateValidationCallback = ValidateServerCertificate
+            RemoteCertificateValidationCallback = acceptAllCerts
+                ? (sender, cert, chain, errors) => true
+                : ValidateServerCertificate
         }, cancellationToken);
 
         return sslStream;

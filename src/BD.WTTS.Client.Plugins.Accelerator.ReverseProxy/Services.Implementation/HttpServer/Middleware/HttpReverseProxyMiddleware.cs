@@ -100,13 +100,17 @@ Actual value was {actualValue}.
         if (domainConfig == defaultDomainConfig &&
             !reverseProxyConfig.Service.OnlyEnableProxyScript)
         {
-            // 部分运营商将奇怪的域名解析到 127.0.0.1 再此排除这些不支持的代理域名
-            var ip = await reverseProxyConfig.DnsAnalysis.AnalysisDomainIpAsync(context.Request.Host.Value!, IDnsAnalysisService.DNS_Dnspods).FirstOrDefaultAsync();
-            if (ip == null || IPAddress.IsLoopback(ip))
+            // 部分运营商将奇怪的域名解析到 127.0.0.1 再此排除这些不支持的代理域名；
+            // 裸 IP 无需做 DNS 污染检查，直接进入默认直连转发。
+            if (!IPAddress.TryParse(context.Request.Host.Host, out _))
             {
-                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                await context.Response.WriteAsync($"域名 {context.Request.Host.Host} 可能已经被 DNS 污染，如果域名为本机域名，请解析为非回环 IP。", Encoding.UTF8);
-                return;
+                var ip = await reverseProxyConfig.DnsAnalysis.AnalysisDomainIpAsync(context.Request.Host.Value!, IDnsAnalysisService.DNS_Dnspods).FirstOrDefaultAsync();
+                if (ip == null || IPAddress.IsLoopback(ip))
+                {
+                    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                    await context.Response.WriteAsync($"域名 {context.Request.Host.Host} 可能已经被 DNS 污染，如果域名为本机域名，请解析为非回环 IP。", Encoding.UTF8);
+                    return;
+                }
             }
         }
 
@@ -204,11 +208,13 @@ Actual value was {actualValue}.
         }
 
         var host = new UriBuilder(uri).Host;
-        // 未配置的域名，但仍然被解析到本机 IP 的域名
-        if (IsDomain(host))
+        // 未配置的域名（含裸 IP）：纳入默认处理走直连转发，不加速也不丢弃。
+        // 注意：裸 IP 必须显式纳入，否则 IsDomain 的 !IPAddress.TryParse 会把裸 IP 排除，
+        // 导致未命中加速规则的裸 IP 在 TwoLevelAgentEnable=false 时走 next() 返回 404。
+        if (IsDomain(host) || IPAddress.TryParse(host, out _))
         {
             logger.LogWarning(
-                "域名 {host} 可能已经被 DNS 污染，如果域名为本机域名，请解析为非回环 IP。", host);
+                "域名 {host} 未命中加速规则，将走默认直连转发（不加速）。", host);
             domainConfig = defaultDomainConfig;
             return true;
         }
